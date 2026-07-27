@@ -1,0 +1,3 @@
+*.lock
+ORIGINAL_PLAN.md
+**/__pycache__/

@@ -1,0 +1,54 @@
+mode: deq
+batch_size: 128
+network:
+  adjoint: false
+  encoder: null
+  fill: zeros
+  initialization: kaiming
+  model:
+    args: {max_gain: 5.0, reparam: true}
+    name: ShiftRelu1
+  net_struct:
+    - args:
+        fully_connect_node: 50
+        height: 28
+        kernel_repeat: 1
+        neighbor_size: 4
+        num_channel: 1
+        repeat: [1, 1]
+        width: 28
+      name: _mix_connect
+    - args:
+        fully_connect_node: 50
+        height: 28
+        kernel_repeat: 1
+        neighbor_size: 4
+        num_channel: 1
+        repeat: [1, 1]
+        width: 28
+      name: _mix_connect
+  projector: last10
+  residual: null
+solver:
+  method: anderson
+  tol: 1.0e-4
+  max_iter: 40
+  anderson_m: 4
+  beta: 1.0
+  backward_mode: phantom
+  phantom_damp: 0.5
+fabric:
+  gamma_floor: 0.05
+  max_gain: 5.0
+  input_nodes: [1, 2, 3, 4]
+  merge: composed
+test_bench: mnist
+test:
+  metric: [top1]
+train:
+  lr: 0.001
+  num_epoch: 3
+  save_epoch: 1
+  scheduler: none
+num_worker: 0
+contract_check_every: 1

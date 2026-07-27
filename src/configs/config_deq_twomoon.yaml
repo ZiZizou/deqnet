@@ -1,0 +1,47 @@
+mode: deq
+batch_size: 128
+network:
+  adjoint: false
+  encoder: mlp_2_2
+  fill: zeros
+  initialization: kaiming
+  model:
+    args: {max_gain: 5.0, reparam: true}
+    name: ShiftTanh1
+  net_struct:
+    - args:
+        num_node: 4
+        repeat: [3, 3]
+      name: _fully_connect
+    - args:
+        num_node: 4
+        repeat: [3, 3]
+      name: _fully_connect
+  projector: last2
+  residual: null
+solver:
+  method: anderson
+  tol: 1.0e-5
+  max_iter: 80
+  anderson_m: 5
+  beta: 1.0
+  backward_mode: exact
+  backward_tol: 1.0e-5
+  backward_max_iter: 30
+fabric:
+  gamma_floor: 0.05
+  max_gain: 5.0
+  input_nodes: [1, 2]
+  merge: composed
+test_bench: twomoon
+test:
+  metric: []
+train:
+  lr: 0.005
+  num_epoch: 5
+  save_epoch: 1
+  scheduler: none
+num_worker: 0
+contract_check_every: 2
+visualization:
+  num_sample: 200

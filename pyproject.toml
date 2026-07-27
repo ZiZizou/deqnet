@@ -1,0 +1,20 @@
+[project]
+name = "deqnet"
+version = "0.1.0"
+description = "DEQ extension for KirchhoffNet"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "torchvision",
+    "matplotlib",
+    "scikit-learn",
+    "pyyaml",
+    "torchdiffeq",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

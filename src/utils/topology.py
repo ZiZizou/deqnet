@@ -3,6 +3,33 @@ import torch.nn as nn
 import numpy as np
 from typing import List, Dict, Union, Optional, Any, Tuple
 import sys
+
+def merge_topologies(topo_list, inter_layer_edges=None):
+    """Offset node indices of each topology and concatenate edge lists.
+
+    Parameters
+    ----------
+    topo_list : sequence of (src, des, cnt) tensors, each from _preprocess_net_topo.
+    inter_layer_edges : optional tensor of edges to append after merging
+                        (e.g. cross-layer conductors).  None means no extras.
+
+    Returns
+    -------
+    dict with keys:
+        'src'    : concatenated source indices, shape (E_total,)
+        'des'    : concatenated destination indices, shape (E_total,)
+        'num_nodes' : total number of nodes (incl. ground at index 0)
+        'cnt'    : per-edge index within the merged graph
+
+    TODO(v2): implement when fused-mode EquilibriumBlock is built.  For now
+              this raises NotImplementedError so callers can fall back to
+              the composed (per-layer DEQ) path.
+    """
+    raise NotImplementedError(
+        "merge_topologies is a TODO(v2) stub.  Use composed EquilibriumBlock "
+        "(each layer solved sequentially) by passing mode='composed'."
+    )
+
 def generate_topology(topo_dict: Dict) -> torch.Tensor:
     connection = torch.tensor(getattr(sys.modules[__name__], topo_dict['name'])(**topo_dict['args'])[0])
     return connection

@@ -1,4 +1,3 @@
-import torchdiffeq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,96 +10,236 @@ from math import ceil
 import sys
 
 
+_MONOTONE_ACTIVATIONS = {'relu', 'leaky_relu', 'tanh', 'sigmoid', 'elu', 'softplus'}
+
+
 class Device(nn.Module):
-    def __init__(self, num_edge, negation, activation):
+    def __init__(self, num_edge, negation, activation, max_gain=10.0, reparam=True):
         super(Device, self).__init__()
+        if not reparam:
+            warnings.warn(
+                "Device with reparam=False is legacy ODE-only and does NOT satisfy "
+                "translation invariance / passivity.  Do not use in DEQ mode.",
+                DeprecationWarning,
+            )
         self.num_edge = num_edge
-        if negation == True:
-            self.param = nn.Parameter(torch.ones(2, self.num_edge))
+        self.max_gain = float(max_gain)
+        self.reparam = bool(reparam)
+        if activation not in _MONOTONE_ACTIVATIONS:
+            warnings.warn(
+                f"activation={activation!r} is not in the DEQ monotone whitelist "
+                f"{_MONOTONE_ACTIVATIONS}; passivity certificate will be conservative.",
+                UserWarning,
+            )
+        self.activation_name = activation
+        self.activation_function = (
+            getattr(F, activation) if activation is not None else lambda x: x
+        )
+        if negation:
+            self.raw_gain = nn.Parameter(torch.zeros(self.num_edge))
+            self.bias = nn.Parameter(torch.zeros(self.num_edge))
+            if not self.reparam:
+                self.param = nn.Parameter(torch.stack([self.bias.detach(), torch.zeros(self.num_edge)], dim=0))
         else:
-            self.param = nn.Parameter(torch.ones(3, self.num_edge))
+            self.raw_gain = nn.Parameter(torch.zeros(self.num_edge))
+            self.raw_gain_b = nn.Parameter(torch.zeros(self.num_edge))
+            self.bias = nn.Parameter(torch.zeros(self.num_edge))
+            if not self.reparam:
+                self.param = nn.Parameter(torch.zeros(3, self.num_edge))
         self.negation = negation
-        self.activation_function = getattr(F, activation) if activation is not None else lambda x: x
+
+    @property
+    def gain(self):
+        if self.reparam:
+            return self.max_gain * torch.sigmoid(self.raw_gain)
+        if self.negation:
+            return self.param[1]
+        return self.param[1]
+
+    def max_slope(self):
+        g = self.gain.detach()
+        if self.activation_name == 'sigmoid':
+            return g / 4.0
+        return g
+
     def forward(self, x_src, x_des):
         if self.negation:
-            res = self.activation_function(self.param[1] * (x_src - x_des) + self.param[0])
+            x = x_src - x_des
+            res = self.activation_function(self.gain * x + self.bias)
         else:
-            res = self.activation_function(x_src * self.param[0] + x_des * self.param[1] + self.param[2])
+            if self.reparam:
+                res = self.activation_function(self.gain * x_src + self.gain * x_des + self.bias)
+            else:
+                res = self.activation_function(x_src * self.param[0] + x_des * self.param[1] + self.param[2])
         return res
+
 
 class ShiftRelu1(nn.Module):
-    def __init__(self, num_edge):
+    def __init__(self, num_edge, max_gain=10.0, reparam=True):
         super(ShiftRelu1, self).__init__()
         self.num_edge = num_edge
-        self.param = nn.Parameter(torch.ones(2, self.num_edge))
+        self.max_gain = float(max_gain)
+        self.reparam = bool(reparam)
+        self.raw_gain = nn.Parameter(torch.zeros(num_edge))
+        self.bias = nn.Parameter(torch.zeros(num_edge))
+        if not self.reparam:
+            self.param = nn.Parameter(torch.stack([self.bias.detach(), torch.zeros(num_edge)], dim=0))
+
+    @property
+    def gain(self):
+        if self.reparam:
+            return self.max_gain * torch.sigmoid(self.raw_gain)
+        return self.param[1]
+
+    def max_slope(self):
+        return self.gain.detach()
 
     def forward(self, x_src, x_des):
         x = x_src - x_des
-        res = self.param[1] * F.relu(x - self.param[0])
+        res = self.gain * F.relu(x - self.bias)
         return res
 
+
 class ShiftLeakyRelu1(nn.Module):
-    def __init__(self, num_edge):
+    def __init__(self, num_edge, max_gain=10.0, reparam=True):
         super(ShiftLeakyRelu1, self).__init__()
         self.num_edge = num_edge
-        self.param = nn.Parameter(torch.ones(2, self.num_edge))
+        self.max_gain = float(max_gain)
+        self.reparam = bool(reparam)
+        self.raw_gain = nn.Parameter(torch.zeros(num_edge))
+        self.bias = nn.Parameter(torch.zeros(num_edge))
+        if not self.reparam:
+            self.param = nn.Parameter(torch.stack([self.bias.detach(), torch.zeros(num_edge)], dim=0))
+
+    @property
+    def gain(self):
+        if self.reparam:
+            return self.max_gain * torch.sigmoid(self.raw_gain)
+        return self.param[1]
+
+    def max_slope(self):
+        return self.gain.detach()
 
     def forward(self, x_src, x_des):
         x = x_src - x_des
-        res = self.param[1] * F.leaky_relu(x - self.param[0])
+        res = self.gain * F.leaky_relu(x - self.bias)
         return res
 
 
 class ShiftRelu2(nn.Module):
-    def __init__(self, num_edge):
+    def __init__(self, num_edge, max_gain=10.0, reparam=True):
         super(ShiftRelu2, self).__init__()
         self.num_edge = num_edge
-        self.param = nn.Parameter(torch.ones(3, self.num_edge))
+        self.max_gain = float(max_gain)
+        self.reparam = bool(reparam)
+        self.raw_gain_src = nn.Parameter(torch.zeros(num_edge))
+        self.raw_gain_des = nn.Parameter(torch.zeros(num_edge))
+        self.bias = nn.Parameter(torch.zeros(num_edge))
+        if not self.reparam:
+            self.param = nn.Parameter(torch.zeros(3, num_edge))
 
     def forward(self, x_src, x_des):
-        res = F.relu(x_src * self.param[0] + x_des * self.param[1] + self.param[2])
+        if self.reparam:
+            gs = self.max_gain * torch.sigmoid(self.raw_gain_src)
+            gd = self.max_gain * torch.sigmoid(self.raw_gain_des)
+            res = F.relu(gs * x_src + gd * x_des + self.bias)
+        else:
+            res = F.relu(x_src * self.param[0] + x_des * self.param[1] + self.param[2])
         return res
+
 
 class ShiftLeakyRelu2(nn.Module):
-    def __init__(self, num_edge):
+    def __init__(self, num_edge, max_gain=10.0, reparam=True):
         super(ShiftLeakyRelu2, self).__init__()
         self.num_edge = num_edge
-        self.param = nn.Parameter(torch.ones(3, self.num_edge))
+        self.max_gain = float(max_gain)
+        self.reparam = bool(reparam)
+        self.raw_gain_src = nn.Parameter(torch.zeros(num_edge))
+        self.raw_gain_des = nn.Parameter(torch.zeros(num_edge))
+        self.bias = nn.Parameter(torch.zeros(num_edge))
+        if not self.reparam:
+            self.param = nn.Parameter(torch.zeros(3, num_edge))
 
     def forward(self, x_src, x_des):
-        res = F.leaky_relu(x_src * self.param[0] + x_des * self.param[1] + self.param[2])
+        if self.reparam:
+            gs = self.max_gain * torch.sigmoid(self.raw_gain_src)
+            gd = self.max_gain * torch.sigmoid(self.raw_gain_des)
+            res = F.leaky_relu(gs * x_src + gd * x_des + self.bias)
+        else:
+            res = F.leaky_relu(x_src * self.param[0] + x_des * self.param[1] + self.param[2])
         return res
+
 
 class ShiftTanh1(nn.Module):
-    def __init__(self, num_edge):
+    def __init__(self, num_edge, max_gain=10.0, reparam=True):
         super(ShiftTanh1, self).__init__()
         self.num_edge = num_edge
-        self.param = nn.Parameter(torch.ones(3, self.num_edge))
+        self.max_gain = float(max_gain)
+        self.reparam = bool(reparam)
+        self.raw_gain = nn.Parameter(torch.zeros(num_edge))
+        self.bias = nn.Parameter(torch.zeros(num_edge))
+        if not self.reparam:
+            self.param = nn.Parameter(torch.stack([self.bias.detach(), torch.zeros(num_edge), torch.zeros(num_edge)], dim=0))
+
+    @property
+    def gain(self):
+        if self.reparam:
+            return self.max_gain * torch.sigmoid(self.raw_gain)
+        return self.param[1]
+
+    def max_slope(self):
+        return self.gain.detach()
 
     def forward(self, x_src, x_des):
         x = x_src - x_des
-        res = F.tanh(x * self.param[1] + self.param[0])
+        res = F.tanh(self.gain * x + self.bias)
         return res
+
 
 class ShiftTanh2(nn.Module):
-    def __init__(self, num_edge):
+    def __init__(self, num_edge, max_gain=10.0, reparam=True):
         super(ShiftTanh2, self).__init__()
         self.num_edge = num_edge
-        self.param = nn.Parameter(torch.ones(3, self.num_edge))
+        self.max_gain = float(max_gain)
+        self.reparam = bool(reparam)
+        self.raw_gain_src = nn.Parameter(torch.zeros(num_edge))
+        self.raw_gain_des = nn.Parameter(torch.zeros(num_edge))
+        self.bias = nn.Parameter(torch.zeros(num_edge))
+        if not self.reparam:
+            self.param = nn.Parameter(torch.zeros(3, num_edge))
 
     def forward(self, x_src, x_des):
-        res = F.tanh(x_src * self.param[0] + x_des * self.param[1] + self.param[2])
+        if self.reparam:
+            gs = self.max_gain * torch.sigmoid(self.raw_gain_src)
+            gd = self.max_gain * torch.sigmoid(self.raw_gain_des)
+            res = F.tanh(gs * x_src + gd * x_des + self.bias)
+        else:
+            res = F.tanh(x_src * self.param[0] + x_des * self.param[1] + self.param[2])
         return res
 
+
 class Conductance(nn.Module):
-    def __init__(self, num_edge):
+    def __init__(self, num_edge, max_gain=10.0, reparam=True):
         super(Conductance, self).__init__()
         self.num_edge = num_edge
-        self.param = nn.Parameter(torch.ones(3, self.num_edge))
+        self.max_gain = float(max_gain)
+        self.reparam = bool(reparam)
+        self.raw_gain = nn.Parameter(torch.zeros(num_edge))
+        if not self.reparam:
+            self.param = nn.Parameter(torch.zeros(3, num_edge))
+
+    @property
+    def gain(self):
+        if self.reparam:
+            return self.max_gain * torch.sigmoid(self.raw_gain)
+        return self.param[0]
+
+    def max_slope(self):
+        return self.gain.detach()
 
     def forward(self, x_src, x_des):
         x = x_src - x_des
-        res = self.param[0] * x
+        res = self.gain * x
         return res
 
 
@@ -174,8 +313,34 @@ class CircuitLayer(nn.Module):
         self.src_node, self.des_node, self.max_node_index, self.num_edge = _preprocess_net_topo(net_topo)
         self.model = getattr(sys.modules[__name__], net_dict['model']['name'])(self.num_edge, **net_dict['model']['args'])
         self.nfe = torch.tensor(0.0)
+        self.raw_gamma = nn.Parameter(torch.tensor(0.0))
+        self.register_buffer('input_map', None)
+        self._gamma_floor = 1e-2
 
-        _init_model_param(net_dict['initialization'], self.model.param)
+        if hasattr(self.model, 'param'):
+            _init_model_param(net_dict['initialization'], self.model.param)
+
+    @property
+    def gamma(self):
+        return F.softplus(self.raw_gamma) + self._gamma_floor
+
+    def set_input_nodes(self, input_nodes, device_index=None):
+        if input_nodes is None or len(input_nodes) == 0:
+            self.input_map = None
+            return
+        n = self.max_node_index
+        d_in = len(input_nodes)
+        S = torch.zeros(n, d_in)
+        for i, node in enumerate(input_nodes):
+            if node < 1 or node > n:
+                raise ValueError(f"input_node {node} out of range [1, {n}] (1-indexed from ground)")
+            S[node - 1, i] = 1.0
+        if device_index is not None and device_index >= 0 and torch.cuda.is_available():
+            S = S.to(f'cuda:{device_index}')
+        self.input_map = S
+
+    def worst_case_D(self):
+        return self.model.max_slope()
 
     def prepare(self, device: List[int]) -> None:
         # device = [-1] (CPU) or a list with elements all >=0 , e.g., [0,1,2,]
@@ -208,6 +373,35 @@ class CircuitLayer(nn.Module):
         result.scatter_add_(-1, des_node.expand_as(state_i), state_i)
 
         return result[..., 1:]
+
+    def rhs(self, v, u=None):
+        """Equilibrium residual f(v,u) = -B^T g(B v_hat) - Gamma v + S u.
+
+        Returns the residual (zero only when v = v*).  Same shape as v.
+        Avoids in-place scatter_add_ for clean autograd.  Result slots are
+        determined by v.shape[-1] (last-dim), not max_node_index, so callers
+        can pass v of any consistent shape.
+        """
+        src_node, des_node = self.src_indices_list[v.get_device()], self.des_indices_list[v.get_device()]
+        aux_v = torch.cat((torch.zeros_like(v[..., :1]), v), dim=-1)
+        state_i = self.model(aux_v[..., src_node], aux_v[..., des_node])
+        # Build result sized to v (not max_node_index) so f = result[..., 1:]
+        # matches v's shape.  This mirrors the legacy zeros_like(v) behavior.
+        batch_shape = v.shape[:-1]
+        dev = v.device
+        dtype = v.dtype
+        result = torch.zeros(*batch_shape, v.shape[-1] + 1, dtype=dtype, device=dev)
+        result = torch.scatter_add(result, -1, src_node.expand_as(state_i), -state_i)
+        result = torch.scatter_add(result, -1, des_node.expand_as(state_i), state_i)
+        f = result[..., 1:]
+        f = f - self.gamma * v
+        if u is not None and self.input_map is not None:
+            S = self.input_map
+            if S.device != f.device:
+                S = S.to(f.device)
+            f = f + u @ S.t()
+        return f
+
 
 class AugCircuitLayer(CircuitLayer):
     def __init__(self, net_struct, net_dict):
@@ -332,3 +526,226 @@ class AugCircuitBlock(nn.Module):
                 middle.append(out)
 
         return (x, middle)
+
+
+# =============================================================================
+# Deep Equilibrium (DEQ) extensions
+# =============================================================================
+from .deq_solver import (
+    anderson as _anderson,
+    fixed_point as _fixed_point,
+    solve_jacobian_transpose as _solve_jt,
+    check_contraction as _check_contraction,
+    ConvergenceWarning as _ConvergenceWarning,
+)
+
+
+class EquilibriumSolve(torch.autograd.Function):
+    """Implicit-differentiation wrapper around an equilibrium solve.
+
+    forward: solve f(v, u) = 0 via Anderson (or fixed-point fallback),
+             starting from v0.  No autograd graph is built.
+
+    backward: re-run rhs_fn with enable_grad, then call .backward(-y) on the
+             residual f_, where y solves J^T y = grad_out.  This populates
+             .grad on all parameters that participated in the closure.
+
+    backward_mode:
+        'exact'   — full CG/fixed-point on J^T y = grad_out  (default, expensive)
+        'phantom' — one VJP step (biased but cheap, robust to ill-conditioned J)
+
+    Class attribute `.last_info` holds the most recent forward's info dict,
+    useful for logging from outside the autograd graph.
+    """
+
+    last_info = None
+
+    @staticmethod
+    def forward(ctx, rhs_fn, v0, u, solver_cfg):
+        cfg = dict(solver_cfg) if solver_cfg is not None else {}
+        method = cfg.pop('method', 'anderson')
+        max_iter = cfg.pop('max_iter', 100)
+        tol = cfg.pop('tol', 1e-6)
+        fwd_kwargs = {k: cfg[k] for k in ('m', 'lam', 'beta') if k in cfg}
+        with torch.no_grad():
+            if method == 'anderson':
+                v_star, info = _anderson(lambda v: rhs_fn(v, u), v0,
+                                          max_iter=max_iter, tol=tol, **fwd_kwargs)
+            elif method == 'fixedpoint':
+                v_star, info = _fixed_point(lambda v: rhs_fn(v, u), v0,
+                                             max_iter=max_iter, tol=tol, **fwd_kwargs)
+            else:
+                raise ValueError(f"Unknown solver method: {method!r}")
+        # Detach + require_grad so the autograd graph can flow even when no
+        # input tensor had requires_grad=True (typical for downstream users).
+        ctx.rhs_fn = rhs_fn
+        ctx.v_star = v_star
+        ctx.u = u
+        ctx.solver_cfg = solver_cfg if solver_cfg is not None else {}
+        ctx.info = info
+        EquilibriumSolve.last_info = info
+        if not v_star.requires_grad:
+            v_star = v_star.detach().requires_grad_(True)
+        return v_star
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        rhs_fn = ctx.rhs_fn
+        v = ctx.v_star
+        u = ctx.u
+        solver_cfg = ctx.solver_cfg
+        mode = solver_cfg.get('backward_mode', 'exact')
+        bt_tol = solver_cfg.get('backward_tol', solver_cfg.get('tol', 1e-6))
+        bt_max = solver_cfg.get('backward_max_iter', solver_cfg.get('max_iter', 50))
+        phantom_damp = float(solver_cfg.get('phantom_damp', 0.5))
+        phantom_steps = int(solver_cfg.get('phantom_steps', 1))
+
+        v_ = v.detach().requires_grad_(True)
+        u_ = u.detach().requires_grad_(True) if u is not None else None
+        with torch.enable_grad():
+            f_ = rhs_fn(v_, u_)
+
+        def f_at_v_only(z):
+            u_det = u.detach() if u is not None else None
+            with torch.enable_grad():
+                return rhs_fn(z, u_det)
+
+        def _jt_apply(y_flat_):
+            y_view = y_flat_.view_as(v.detach())
+            with torch.enable_grad():
+                z = v.detach().clone().requires_grad_(True)
+                fv = rhs_fn(z, u.detach() if u is not None else None)
+            g = torch.autograd.grad(
+                outputs=fv, inputs=z,
+                grad_outputs=y_view, retain_graph=False, allow_unused=True,
+            )[0]
+            if g is None:
+                return torch.zeros_like(y_flat_)
+            return g.reshape(-1).detach()
+
+        grad_flat = grad_out.contiguous().view(-1)
+        if mode == 'phantom':
+            # Phantom gradient (Geng et al. 2021): y <- grad_out - damp*(J^T y_prev - grad_out).
+            # One step of this is the zeroth-order damped correction; multiple steps refine.
+            y_flat = grad_flat.clone()
+            for _ in range(max(phantom_steps, 1)):
+                Jty = _jt_apply(y_flat)
+                y_flat = grad_flat - phantom_damp * (Jty - grad_flat)
+        else:
+            y_flat = _solve_jt(f_at_v_only, v.detach(), grad_out,
+                               tol=bt_tol, max_iter=bt_max).reshape(-1)
+        y = (-y_flat).view_as(grad_out)
+
+        if v_.grad is None:
+            v_.grad = torch.zeros_like(v_)
+        f_.backward(gradient=y, retain_graph=False)
+
+        u_grad = u_.grad if u_ is not None else None
+        return None, None, u_grad, None
+
+
+class EquilibriumBlock(nn.Module):
+    """Composed-mode DEQ block: solve f_k(v_k, v_{k-1}) = 0 per layer.
+
+    Each CircuitLayer reaches its own equilibrium, receiving the previous
+    layer's equilibrium v_{k-1} as its initial condition.  Only the first
+    layer is driven by the input u.
+
+    TODO(v2): add fused mode via topology.merge_topologies for the physical
+              single-equilibrium case (all layers settle simultaneously).
+    """
+
+    def __init__(self, layer_list, solver_cfg, input_cfg):
+        super(EquilibriumBlock, self).__init__()
+        self.layer_list = nn.ModuleList(layer_list)
+        self.solver_cfg = solver_cfg
+        self.input_cfg = input_cfg or {}
+        self.input_nodes = self.input_cfg.get('input_nodes', None)
+        self.last_infos = []
+
+    def prepare(self, device: List[int]) -> None:
+        for layer in self.layer_list:
+            layer.prepare(device)
+            device_index = device[0] if device[0] >= 0 else None
+            layer.set_input_nodes(self.input_nodes, device_index=device_index)
+
+    def forward(self, u, v0=None, return_middle=False):
+        middle = []
+        self.last_infos = []
+        last_v_star = None
+        batch = u.shape[0]
+        device = u.device
+        dtype = u.dtype
+        for i, layer in enumerate(self.layer_list):
+            layer_u = u  # every layer sees u so all layer parameters receive gradients
+            n = layer.max_node_index
+            if (i == 0 and v0 is not None and v0.shape[-1] == n
+                    and v0.shape[0] == batch):
+                init = v0
+            elif (last_v_star is not None and last_v_star.shape[-1] == n
+                    and last_v_star.shape[0] == batch):
+                init = last_v_star.detach()  # warm start; init enters no_grad anyway
+            else:
+                init = torch.zeros(batch, n, device=device, dtype=dtype)
+
+            def rhs_fn(v, _u=layer_u, _layer=layer):
+                return _layer.rhs(v, _u)
+
+            v_star = EquilibriumSolve.apply(rhs_fn, init, layer_u, self.solver_cfg)
+            last_v_star = v_star
+            info = EquilibriumSolve.last_info
+            self.last_infos.append({'layer': i,
+                                     'n_iter': info.get('n_iter', -1) if info else -1,
+                                     'final_residual': info.get('final_residual', float('inf')) if info else float('inf'),
+                                     'converged': info.get('converged', False) if info else False})
+            if return_middle:
+                middle.append(v_star)
+        return (last_v_star, middle)
+
+    def solver_stats(self):
+        return list(self.last_infos)
+
+
+class LinearSolveLayer(nn.Module):
+    """Equilibrium of f(w) = p - R w  <=>  w* = R^{-1} p.
+
+    R must be symmetric positive definite.  Forward is solved by Anderson;
+    backward uses the implicit-function theorem (one VJP + a fixed-point on
+    the transpose operator, same SPD structure, monotone rate lambda_min(R)).
+
+    TODO(v2): integrate into the main EquilibriumBlock as the second-order
+              contribution for streaming RLS-style adaptive filtering demos.
+              The spec's §6 design is preserved here in the docstring:
+
+              # build R by accumulating xx^T over the stream
+              # build p by accumulating e * x over the stream
+              w_star = LinearSolveLayer()(p, R)         # analog Newton step
+              e_next = d_next - w_star @ x_next
+
+    Affine f means backward is exact and cheap (no iterative linear solve
+    required — just one more equilibrium of the same operator).
+    """
+
+    def __init__(self, max_iter=50, tol=1e-6, beta=1.0):
+        super().__init__()
+        self.solver_cfg = {'method': 'anderson', 'max_iter': max_iter, 'tol': tol,
+                            'backward_mode': 'exact', 'beta': beta}
+
+    def _matvec_R(self, w, R):
+        if R.dim() == 3:
+            return torch.einsum('bij,bj->bi', R, w)
+        # R is (n, n); w is (B, n).  Compute R w per batch row: (R @ w.T).T = w @ R.T.
+        return w @ R.t()
+
+    def rhs(self, w, p, R):
+        return p - self._matvec_R(w, R)
+
+    def forward(self, p, R):
+        init = torch.zeros_like(p)
+        last_v_star = None
+
+        def rhs_fn(w, _p=p, _R=R):
+            return self.rhs(w, _p, _R)
+
+        v_star = EquilibriumSolve.apply(rhs_fn, init, p, self.solver_cfg)
+        return v_star
