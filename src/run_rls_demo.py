@@ -33,6 +33,7 @@ import os
 import sys
 import argparse
 import json
+import time
 import numpy as np
 import torch
 
@@ -130,7 +131,8 @@ class FabricRLS:
     eigvalsh branch.
     """
     def __init__(self, d, lam=0.99, R0=None, w_init=None,
-                 max_iter=100, tol=1e-8, beta='chebyshev', device='cpu'):
+                 max_iter=100, tol=1e-8, beta='chebyshev', device='cpu',
+                 log_every=0, log_name=''):
         self.d = d
         self.lam = lam
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
@@ -142,6 +144,9 @@ class FabricRLS:
         self.tol = tol
         self.beta_mode = beta
         self.last_iters = []
+        self.log_every = log_every
+        self.log_name = log_name
+        self._step_count = 0
 
     def _chebyshev_beta(self, R):
         eigs = torch.linalg.eigvalsh(R)
@@ -163,9 +168,16 @@ class FabricRLS:
         w_star = layer(self.p.unsqueeze(0), self.R).squeeze(0)
         # Track iterations from the last EquilibriumSolve.
         from utils.circuit_block import EquilibriumSolve
+        n_iters = -1
         if EquilibriumSolve.last_info is not None:
-            self.last_iters.append(EquilibriumSolve.last_info.get('n_iter', -1))
+            n_iters = EquilibriumSolve.last_info.get('n_iter', -1)
+            self.last_iters.append(n_iters)
         self.w = w_star
+        self._step_count += 1
+        if self.log_every and (self._step_count % self.log_every == 0
+                               or self._step_count == 1):
+            print(f"    [{self.log_name}] sample {self._step_count}"
+                  f"  LinearSolveLayer iters={n_iters}", flush=True)
         return self.w.clone()
 
 
@@ -237,13 +249,21 @@ def run_trial(contender, x, d_obs, w_o):
 # ----------------------------------------------------------------------------
 
 def monte_carlo(contender_factory, w_o, T, sigma, n_trials,
-                 mode='iid', seed_base=0, dtype=torch.float64, device='cpu'):
+                 mode='iid', seed_base=0, dtype=torch.float64, device='cpu',
+                 name='', log_every=1, quiet=False):
     """`contender_factory` is a zero-arg callable returning a fresh contender
-    instance.  Returns (W_mean[T,d], W_runs[n_trials, T, d], per-trial extras list)."""
+    instance.  Returns (W_mean[T,d], W_runs[n_trials, T, d], per-trial extras list).
+
+    `name` and `log_every` control progress logging: prints every `log_every`
+    trials with the elapsed wall time.  Set `quiet=True` to suppress all logging
+    (used when called from inside another logged loop)."""
     device = torch.device(device) if not isinstance(device, torch.device) else device
     d = w_o.shape[0]
     W_runs = torch.zeros(n_trials, T, d, dtype=dtype, device=device)
     extras_all = []
+    if not quiet:
+        print(f"  [{name}] {n_trials} trials, T={T}, mode={mode}", flush=True)
+    loop_start = time.time()
     for trial in range(n_trials):
         x, d_obs = make_stream(w_o, T, sigma, mode=mode,
                                seed=seed_base + trial, dtype=dtype, device=device)
@@ -251,7 +271,18 @@ def monte_carlo(contender_factory, w_o, T, sigma, n_trials,
         W, extras = run_trial(contender, x, d_obs, w_o)
         W_runs[trial] = W
         extras_all.append(extras)
+        if not quiet and (trial + 1) % log_every == 0:
+            elapsed = time.time() - loop_start
+            avg = elapsed / (trial + 1)
+            eta = avg * (n_trials - trial - 1)
+            print(f"    trial {trial + 1}/{n_trials}"
+                  f"  elapsed={elapsed:.1f}s  avg={avg:.2f}s/trial  eta={eta:.1f}s",
+                  flush=True)
     W_mean = W_runs.mean(dim=0)
+    if not quiet:
+        total = time.time() - loop_start
+        print(f"  [{name}] done: {n_trials} trials in {total:.2f}s"
+              f" ({total / max(n_trials, 1):.2f}s/trial)", flush=True)
     return W_mean, W_runs, extras_all
 
 
@@ -461,10 +492,11 @@ def run_experiment(args):
         return DigitalRLS(d=args.d, lam=args.lam_rls, device=device)
     def fabric_lms_factory():
         return FabricLMS(d=args.d, mu=args.mu_lms, dt=args.dt_fabric_lms, device=device)
-    def fabric_rls_factory():
+    def fabric_rls_factory(log_name=''):
         return FabricRLS(d=args.d, lam=args.lam_rls, R0=torch.eye(args.d, device=device),
                          max_iter=args.linear_max_iter, tol=args.linear_tol,
-                         beta=args.linear_beta, device=device)
+                         beta=args.linear_beta, device=device,
+                         log_every=args.fabric_rls_log_every, log_name=log_name)
 
     contenders = {
         'digital_lms': digital_lms_factory,
@@ -475,14 +507,23 @@ def run_experiment(args):
 
     # ---- Part 1: iid ----
     print(f"\n=== iid input, T={args.T}, sigma={args.sigma}, "
-          f"n_trials={args.n_trials} ===")
+          f"n_trials={args.n_trials} ===", flush=True)
     results_iid = {}
     extras_iid = {}
     for name, factory in contenders.items():
-        print(f"  running {name}...")
-        W_mean, _, extras = monte_carlo(factory, w_o, args.T, args.sigma,
+        def factory_wrapped(f=factory, n=name):
+            try:
+                return f(log_name=n)
+            except TypeError:
+                return f()
+        t0 = time.time()
+        W_mean, _, extras = monte_carlo(factory_wrapped,
+                                       w_o, args.T, args.sigma,
                                        args.n_trials, mode='iid',
-                                       seed_base=args.seed, dtype=dtype, device=device)
+                                       seed_base=args.seed, dtype=dtype, device=device,
+                                       name=f'iid/{name}',
+                                       log_every=max(1, args.n_trials // 5))
+        print(f"  [{name}] total: {time.time() - t0:.2f}s", flush=True)
         results_iid[name] = (W_mean, None)
         extras_iid[name] = extras
     plot_learning_curves(out_dir, results_iid, w_o,
@@ -500,22 +541,31 @@ def run_experiment(args):
     plot_settling_budget(out_dir, iters, label='LinearSolveLayer iterations per sample')
     if iters:
         print(f"  settling budget: mean={np.mean(iters):.2f}, max={max(iters)}, "
-              f"median={np.median(iters):.0f}, n={len(iters)}")
+              f"median={np.median(iters):.0f}, n={len(iters)}", flush=True)
 
     # ---- Part 2: AR(1) correlated ----
-    print(f"\n=== AR(1) input (rho=0.9), T={args.T} ===")
+    print(f"\n=== AR(1) input (rho=0.9), T={args.T} ===", flush=True)
     results_ar1 = {}
     for name, factory in contenders.items():
-        print(f"  running {name}...")
-        W_mean, _, _ = monte_carlo(factory, w_o, args.T, args.sigma,
-                                  args.n_trials, mode='ar1',
-                                  seed_base=args.seed, dtype=dtype, device=device)
+        def factory_wrapped(f=factory, n=name):
+            try:
+                return f(log_name=n)
+            except TypeError:
+                return f()
+        t0 = time.time()
+        W_mean, _, _ = monte_carlo(factory_wrapped,
+                                   w_o, args.T, args.sigma,
+                                   args.n_trials, mode='ar1',
+                                   seed_base=args.seed, dtype=dtype, device=device,
+                                   name=f'ar1/{name}',
+                                   log_every=max(1, args.n_trials // 5))
+        print(f"  [{name}] total: {time.time() - t0:.2f}s", flush=True)
         results_ar1[name] = (W_mean, None)
     plot_learning_curves(out_dir, results_ar1, w_o,
                           f'AR(1) $\\rho$=0.9: ensemble-mean $\\|w-w_o\\|^2$')
 
     # ---- Part 3: Tracking experiment ----
-    print(f"\n=== Tracking experiment: time-varying w_o, sweep lambda ===")
+    print(f"\n=== Tracking experiment: time-varying w_o, sweep lambda ===", flush=True)
     lambdas = args.tracking_lambdas
     misadj_rls, misadj_fabric = [], []
     for lam in lambdas:
@@ -524,18 +574,24 @@ def run_experiment(args):
         def frls_factory():
             return FabricRLS(d=args.d, lam=lam, R0=torch.eye(args.d, device=device),
                              max_iter=args.linear_max_iter, tol=args.linear_tol,
-                             beta=args.linear_beta, device=device)
+                             beta=args.linear_beta, device=device,
+                             log_every=0, log_name='')
         # Single trial per lambda (averaging in tracking would average over
         # the time-varying trajectory, which we want).
         x, d_obs, w_o_track = make_tracking_stream(
             w_o, args.T, args.sigma, args.process_std,
             seed=args.seed, dtype=dtype, device=device)
+        t0 = time.time()
         W_rls, _ = run_trial(rls_factory(), x, d_obs, w_o_track)
+        dt_d = time.time() - t0
+        t0 = time.time()
         W_frls, _ = run_trial(frls_factory(), x, d_obs, w_o_track)
+        dt_f = time.time() - t0
         misadj_rls.append(steady_state_misadjustment(W_rls, w_o_track))
         misadj_fabric.append(steady_state_misadjustment(W_frls, w_o_track))
-        print(f"  lambda={lam}: digital RLS misadj={misadj_rls[-1]:.4e}, "
-              f"fabric RLS misadj={misadj_fabric[-1]:.4e}")
+        print(f"  lambda={lam}: digital RLS misadj={misadj_rls[-1]:.4e}"
+              f" ({dt_d:.2f}s), fabric RLS misadj={misadj_fabric[-1]:.4e}"
+              f" ({dt_f:.2f}s)", flush=True)
     plot_misadjust_vs_lambda(out_dir, lambdas, misadj_rls, misadj_fabric)
 
     # ---- Part 4: Ljung overlay ----
@@ -591,6 +647,9 @@ def parse_args():
                              "which GPU (default 0).")
     parser.add_argument('--gpu_id', type=int, default=0,
                         help="GPU index when --gpu is set. Ignored otherwise.")
+    parser.add_argument('--fabric_rls_log_every', type=int, default=0,
+                        help="Log FabricRLS settling-iter count every N samples "
+                             "(0 = silent, default). Useful for diagnosing solver cost.")
     return parser.parse_args()
 
 
