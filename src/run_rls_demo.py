@@ -42,16 +42,36 @@ sys.path.insert(0, THIS_DIR)
 from utils.circuit_block import LinearSolveLayer
 
 
+def _resolve_device(gpu_arg):
+    """Resolve --gpu flag to a torch.device.
+
+    -1  : auto — use 'cuda' if any GPU available, else 'cpu'
+     0+ : cuda:<gpu> if available, else raise
+    -2  : force CPU
+    """
+    if gpu_arg == -2:
+        return torch.device('cpu')
+    if gpu_arg >= 0:
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"--gpu {gpu_arg} requested but CUDA is not available")
+        return torch.device(f'cuda:{gpu_arg}')
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
+
+
 # ----------------------------------------------------------------------------
 # 1. Contenders
 # ----------------------------------------------------------------------------
 
 class DigitalLMS:
     """w <- w + mu * e * x, scalar mu."""
-    def __init__(self, d, mu=0.05, w_init=None):
+    def __init__(self, d, mu=0.05, w_init=None, device='cpu'):
         self.d = d
         self.mu = mu
-        self.w = torch.zeros(d) if w_init is None else w_init.clone()
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        self.w = (torch.zeros(d, device=self.device) if w_init is None
+                  else w_init.clone().to(self.device))
 
     def step(self, x_t, d_t):
         e = d_t - self.w @ x_t
@@ -62,11 +82,13 @@ class DigitalLMS:
 class DigitalRLS:
     """Standard RLS with forgetting factor lambda.  Maintains P = R^{-1}
     for O(d^2) updates instead of O(d^3) explicit solve per step."""
-    def __init__(self, d, lam=0.99, delta=1.0, w_init=None):
+    def __init__(self, d, lam=0.99, delta=1.0, w_init=None, device='cpu'):
         self.d = d
         self.lam = lam
-        self.w = torch.zeros(d) if w_init is None else w_init.clone()
-        self.P = (1.0 / delta) * torch.eye(d)
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        self.w = (torch.zeros(d, device=self.device) if w_init is None
+                  else w_init.clone().to(self.device))
+        self.P = (1.0 / delta) * torch.eye(d, device=self.device)
 
     def step(self, x_t, d_t):
         # Standard RLS: k = P x / (lam + x^T P x); w += k * e; P = (P - k x^T P) / lam
@@ -85,11 +107,13 @@ class FabricLMS:
     Integrated by forward Euler at fine dt.  When mu*dt -> 0, this converges
     onto the same trajectory as DigitalLMS with the same mu*dt — the Ljung
     experiment demonstrates this directly."""
-    def __init__(self, d, mu=0.05, dt=0.1, w_init=None):
+    def __init__(self, d, mu=0.05, dt=0.1, w_init=None, device='cpu'):
         self.d = d
         self.mu = mu
         self.dt = dt
-        self.w = torch.zeros(d) if w_init is None else w_init.clone()
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        self.w = (torch.zeros(d, device=self.device) if w_init is None
+                  else w_init.clone().to(self.device))
 
     def step(self, x_t, d_t):
         # Hold x and d constant over the inner Euler substep.
@@ -111,12 +135,14 @@ class FabricRLS:
     eigvalsh branch.
     """
     def __init__(self, d, lam=0.99, R0=None, w_init=None,
-                 max_iter=100, tol=1e-8, beta='chebyshev'):
+                 max_iter=100, tol=1e-8, beta='chebyshev', device='cpu'):
         self.d = d
         self.lam = lam
-        self.R = R0 if R0 is not None else torch.eye(d)
-        self.w = torch.zeros(d) if w_init is None else w_init.clone()
-        self.p = torch.zeros(d)
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        self.R = (R0.to(self.device) if R0 is not None else torch.eye(d, device=self.device))
+        self.w = (torch.zeros(d, device=self.device) if w_init is None
+                  else w_init.clone().to(self.device))
+        self.p = torch.zeros(d, device=self.device)
         self.max_iter = max_iter
         self.tol = tol
         self.beta_mode = beta
@@ -152,40 +178,42 @@ class FabricRLS:
 # 2. Stream generators
 # ----------------------------------------------------------------------------
 
-def make_stream(w_o, T, sigma, mode='iid', seed=0, dtype=torch.float64):
+def make_stream(w_o, T, sigma, mode='iid', seed=0, dtype=torch.float64, device='cpu'):
     """Generate (x_t, d_t) stream of length T.
 
     mode='iid':   x_t ~ N(0, I)
     mode='ar1':   x_t = rho * x_{t-1} + sqrt(1-rho^2) * eps_t, eps_t ~ N(0, I)
     """
-    g = torch.Generator().manual_seed(seed)
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    g = torch.Generator(device=device).manual_seed(seed)
     d = w_o.shape[0]
-    x = torch.zeros(T, d, dtype=dtype)
+    x = torch.zeros(T, d, dtype=dtype, device=device)
     if mode == 'iid':
-        x = torch.randn(T, d, generator=g, dtype=dtype)
+        x = torch.randn(T, d, generator=g, dtype=dtype, device=device)
     elif mode == 'ar1':
         rho = 0.9
-        eps = torch.randn(T, d, generator=g, dtype=dtype)
+        eps = torch.randn(T, d, generator=g, dtype=dtype, device=device)
         x[0] = eps[0]
         for t in range(1, T):
             x[t] = rho * x[t - 1] + np.sqrt(1 - rho ** 2) * eps[t]
     else:
         raise ValueError(f"unknown mode: {mode}")
-    nu = sigma * torch.randn(T, generator=g, dtype=dtype)
+    nu = sigma * torch.randn(T, generator=g, dtype=dtype, device=device)
     d_obs = x @ w_o + nu
     return x, d_obs
 
 
-def make_tracking_stream(w_o0, T, sigma, process_std, seed=0, dtype=torch.float64):
+def make_tracking_stream(w_o0, T, sigma, process_std, seed=0, dtype=torch.float64, device='cpu'):
     """Stream with time-varying plant: w_o(t+1) = w_o(t) + q_t, q_t ~ N(0, process_std^2 * I)."""
-    g = torch.Generator().manual_seed(seed)
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    g = torch.Generator(device=device).manual_seed(seed)
     d = w_o0.shape[0]
-    x = torch.randn(T, d, generator=g, dtype=dtype)
-    w_o = torch.zeros(T, d, dtype=dtype)
+    x = torch.randn(T, d, generator=g, dtype=dtype, device=device)
+    w_o = torch.zeros(T, d, dtype=dtype, device=device)
     w_o[0] = w_o0
     for t in range(1, T):
-        w_o[t] = w_o[t - 1] + process_std * torch.randn(d, generator=g, dtype=dtype)
-    nu = sigma * torch.randn(T, generator=g, dtype=dtype)
+        w_o[t] = w_o[t - 1] + process_std * torch.randn(d, generator=g, dtype=dtype, device=device)
+    nu = sigma * torch.randn(T, generator=g, dtype=dtype, device=device)
     d_obs = (x * w_o).sum(dim=-1) + nu
     return x, d_obs, w_o
 
@@ -200,7 +228,7 @@ def run_trial(contender, x, d_obs, w_o):
     static plant or (T, d) for tracking."""
     T = x.shape[0]
     d = x.shape[1]
-    W = torch.zeros(T, d, dtype=x.dtype)
+    W = torch.zeros(T, d, dtype=x.dtype, device=x.device)
     for t in range(T):
         W[t] = contender.step(x[t], d_obs[t])
     extras = {}
@@ -214,15 +242,16 @@ def run_trial(contender, x, d_obs, w_o):
 # ----------------------------------------------------------------------------
 
 def monte_carlo(contender_factory, w_o, T, sigma, n_trials,
-                 mode='iid', seed_base=0, dtype=torch.float64):
+                 mode='iid', seed_base=0, dtype=torch.float64, device='cpu'):
     """`contender_factory` is a zero-arg callable returning a fresh contender
     instance.  Returns (W_mean[T,d], W_runs[n_trials, T, d], per-trial extras list)."""
+    device = torch.device(device) if not isinstance(device, torch.device) else device
     d = w_o.shape[0]
-    W_runs = torch.zeros(n_trials, T, d, dtype=dtype)
+    W_runs = torch.zeros(n_trials, T, d, dtype=dtype, device=device)
     extras_all = []
     for trial in range(n_trials):
         x, d_obs = make_stream(w_o, T, sigma, mode=mode,
-                               seed=seed_base + trial, dtype=dtype)
+                               seed=seed_base + trial, dtype=dtype, device=device)
         contender = contender_factory()
         W, extras = run_trial(contender, x, d_obs, w_o)
         W_runs[trial] = W
@@ -415,23 +444,32 @@ def run_experiment(args):
     torch.set_default_dtype(torch.float64)
     dtype = torch.float64
 
+    # ---- Device selection ----
+    device = _resolve_device(args.gpu)
+    if device.type == 'cuda':
+        torch.cuda.manual_seed(args.seed)
+        gpu_name = torch.cuda.get_device_name(device)
+        print(f"Device: {device} ({gpu_name})")
+    else:
+        print(f"Device: {device}")
+
     # ---- Common plant ----
-    g = torch.Generator().manual_seed(args.seed)
-    w_o = torch.randn(args.d, generator=g, dtype=dtype)
+    g = torch.Generator(device=device).manual_seed(args.seed)
+    w_o = torch.randn(args.d, generator=g, dtype=dtype, device=device)
     w_o = w_o / w_o.norm()  # unit-norm plant
     print(f"True plant ||w_o|| = {w_o.norm().item():.4f}, d = {args.d}")
 
     # ---- 4 contenders ----
     def digital_lms_factory():
-        return DigitalLMS(d=args.d, mu=args.mu_lms)
+        return DigitalLMS(d=args.d, mu=args.mu_lms, device=device)
     def digital_rls_factory():
-        return DigitalRLS(d=args.d, lam=args.lam_rls)
+        return DigitalRLS(d=args.d, lam=args.lam_rls, device=device)
     def fabric_lms_factory():
-        return FabricLMS(d=args.d, mu=args.mu_lms, dt=args.dt_fabric_lms)
+        return FabricLMS(d=args.d, mu=args.mu_lms, dt=args.dt_fabric_lms, device=device)
     def fabric_rls_factory():
-        return FabricRLS(d=args.d, lam=args.lam_rls, R0=torch.eye(args.d),
+        return FabricRLS(d=args.d, lam=args.lam_rls, R0=torch.eye(args.d, device=device),
                          max_iter=args.linear_max_iter, tol=args.linear_tol,
-                         beta=args.linear_beta)
+                         beta=args.linear_beta, device=device)
 
     contenders = {
         'digital_lms': digital_lms_factory,
@@ -449,7 +487,7 @@ def run_experiment(args):
         print(f"  running {name}...")
         W_mean, _, extras = monte_carlo(factory, w_o, args.T, args.sigma,
                                        args.n_trials, mode='iid',
-                                       seed_base=args.seed, dtype=dtype)
+                                       seed_base=args.seed, dtype=dtype, device=device)
         results_iid[name] = (W_mean, None)
         extras_iid[name] = extras
     plot_learning_curves(out_dir, results_iid, w_o,
@@ -476,7 +514,7 @@ def run_experiment(args):
         print(f"  running {name}...")
         W_mean, _, _ = monte_carlo(factory, w_o, args.T, args.sigma,
                                   args.n_trials, mode='ar1',
-                                  seed_base=args.seed, dtype=dtype)
+                                  seed_base=args.seed, dtype=dtype, device=device)
         results_ar1[name] = (W_mean, None)
     plot_learning_curves(out_dir, results_ar1, w_o,
                           f'AR(1) $\\rho$=0.9: ensemble-mean $\\|w-w_o\\|^2$')
@@ -487,16 +525,16 @@ def run_experiment(args):
     misadj_rls, misadj_fabric = [], []
     for lam in lambdas:
         def rls_factory():
-            return DigitalRLS(d=args.d, lam=lam)
+            return DigitalRLS(d=args.d, lam=lam, device=device)
         def frls_factory():
-            return FabricRLS(d=args.d, lam=lam, R0=torch.eye(args.d),
+            return FabricRLS(d=args.d, lam=lam, R0=torch.eye(args.d, device=device),
                              max_iter=args.linear_max_iter, tol=args.linear_tol,
-                             beta=args.linear_beta)
+                             beta=args.linear_beta, device=device)
         # Single trial per lambda (averaging in tracking would average over
         # the time-varying trajectory, which we want).
         x, d_obs, w_o_track = make_tracking_stream(
             w_o, args.T, args.sigma, args.process_std,
-            seed=args.seed, dtype=dtype)
+            seed=args.seed, dtype=dtype, device=device)
         W_rls, _ = run_trial(rls_factory(), x, d_obs, w_o_track)
         W_frls, _ = run_trial(frls_factory(), x, d_obs, w_o_track)
         misadj_rls.append(steady_state_misadjustment(W_rls, w_o_track))
@@ -508,7 +546,7 @@ def run_experiment(args):
     # ---- Part 4: Ljung overlay ----
     print(f"\n=== Ljung overlay: digital LMS -> continuous LMS as mu*dt -> 0 ===")
     x_lj, d_lj = make_stream(w_o, args.T, args.sigma, mode='iid',
-                              seed=args.seed, dtype=dtype)
+                              seed=args.seed, dtype=dtype, device=device)
     mu_values = [0.05, 0.05, 0.05]
     dt_values = [1.0, 0.5, 0.1]  # decreasing step sizes
     plot_ljung_overlay(out_dir, w_o, x_lj, d_lj, mu_values, dt_values)
@@ -519,6 +557,7 @@ def run_experiment(args):
         'T': args.T,
         'sigma': args.sigma,
         'n_trials': args.n_trials,
+        'device': str(device),
         'settling': {'mean': float(np.mean(iters)) if iters else None,
                      'max': int(max(iters)) if iters else None,
                      'median': float(np.median(iters)) if iters else None,
@@ -552,6 +591,9 @@ def parse_args():
     parser.add_argument('--process_std', type=float, default=1e-3)
     parser.add_argument('--tracking_lambdas', type=float, nargs='+',
                         default=[0.90, 0.95, 0.98, 0.99, 0.995, 0.999])
+    parser.add_argument('--gpu', type=int, default=-1,
+                        help="Device selector: -1 = auto (use CUDA if available, else CPU), "
+                             "0+ = use cuda:<gpu>, -2 = force CPU.")
     return parser.parse_args()
 
 
