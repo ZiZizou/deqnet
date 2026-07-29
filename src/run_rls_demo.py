@@ -448,7 +448,7 @@ def run_experiment(args):
     device = _resolve_device(args.gpu)
     if device.type == 'cuda':
         torch.cuda.manual_seed(args.seed)
-        gpu_name = torch.cuda.get_device_name(device)
+        gpu_name = torch.cuda.get_device_name(device.index)
         print(f"Device: {device} ({gpu_name})")
     else:
         print(f"Device: {device}")
