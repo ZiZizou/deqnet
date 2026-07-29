@@ -1,0 +1,56 @@
+batch_size: 128
+contract_check_every: 2
+fabric:
+  gamma_floor: 0.05
+  input_nodes:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  max_gain: 5.0
+  merge: composed
+mode: deq
+network:
+  adjoint: false
+  encoder: null
+  fill: zeros
+  initialization: kaiming
+  model:
+    args:
+      max_gain: 5.0
+      reparam: true
+    name: ShiftRelu1
+  net_struct:
+  - args:
+      num_node: 6
+      repeat:
+      - 4
+      - 4
+    name: _fully_connect
+  - args:
+      num_node: 6
+      repeat:
+      - 4
+      - 4
+    name: _fully_connect
+  projector: last1
+  residual: null
+num_worker: 0
+solver:
+  anderson_m: 5
+  backward_max_iter: 30
+  backward_mode: exact
+  backward_tol: 1.0e-05
+  beta: 0.05
+  max_iter: 60
+  method: anderson
+  tol: 1.0e-05
+test:
+  metric: []
+test_bench: toyregress
+train:
+  lr: 0.005
+  num_epoch: 5
+  save_epoch: 1
+  scheduler: none

@@ -130,16 +130,23 @@ def test_solve_jacobian_transpose_linear():
 
 
 def test_check_contraction_positive_margin():
-    """A passive SPD stiffness matrix should yield positive margin."""
+    """A passive SPD stiffness matrix should yield positive margin and
+    lambda_min_M > gamma_floor (the contraction rate the solver actually
+    depends on)."""
     n = 5
     src = torch.tensor([1, 2, 3, 4], dtype=torch.long)
     des = torch.tensor([2, 3, 4, 5], dtype=torch.long)
     D = torch.tensor([2.0, 2.0, 2.0, 2.0])
     gamma = torch.full((n,), 1.0)
     result = check_contraction(src, des, n, D, gamma)
-    print(f"[check_contraction] lambda_max={result['lambda_max_J']:.4f} "
+    print(f"[check_contraction] lambda_max_J={result['lambda_max_J']:.4f} "
+          f"lambda_min_M={result['lambda_min_M']:.4f} "
           f"margin={result['contraction_margin']:.4f} passive={result['passive']}")
     assert result['passive'], "J should be negative definite for passive D"
+    assert result['lambda_min_M'] >= 1.0, (
+        f"lambda_min_M should be >= gamma=1 (D contributes too), got {result['lambda_min_M']:.4f}"
+    )
+    assert result['lambda_min_M'] < result['lambda_max_M']
     print("  PASS")
 
 
@@ -155,8 +162,31 @@ def test_check_contraction_fails_when_gamma_zero():
     D = torch.tensor([2.0, 2.0, 2.0, 2.0])
     gamma = torch.zeros(n)
     result = check_contraction(src, des, n, D, gamma)
-    print(f"[chain_with_zero_gamma] lambda_max={result['lambda_max_J']:.4e}")
+    print(f"[chain_with_zero_gamma] lambda_max_J={result['lambda_max_J']:.4e} "
+          f"lambda_min_M={result['lambda_min_M']:.4e}")
     assert not result['passive'], "J should not be strictly negative definite when gamma=0 on a chain graph"
+    assert result['lambda_min_M'] < 1e-3, (
+        f"lambda_min_M should be ~0 (chain graph Laplacian has zero eigenvalue when gamma=0), "
+        f"got {result['lambda_min_M']:.4e}"
+    )
+    print("  PASS")
+
+
+def test_check_contraction_lambda_min_M_tracks_gamma():
+    """lambda_min_M must equal gamma when D=0 and gamma is uniform (the
+    floor case where only the leakage contracts).  This is the regime that
+    matters for late-training collapse detection."""
+    n = 4
+    src = torch.tensor([1, 2, 3], dtype=torch.long)
+    des = torch.tensor([2, 3, 4], dtype=torch.long)
+    D = torch.zeros(3)  # all devices in dead zone
+    gamma_val = 0.05
+    gamma = torch.full((n,), gamma_val)
+    result = check_contraction(src, des, n, D, gamma)
+    print(f"[D=0] lambda_min_M={result['lambda_min_M']:.4f} (should be ~{gamma_val})")
+    assert abs(result['lambda_min_M'] - gamma_val) < 1e-4, (
+        f"lambda_min_M should equal gamma when D=0, got {result['lambda_min_M']:.4f} vs {gamma_val}"
+    )
     print("  PASS")
 
 
@@ -180,5 +210,6 @@ if __name__ == '__main__':
     test_solve_jacobian_transpose_linear()
     test_check_contraction_positive_margin()
     test_check_contraction_fails_when_gamma_zero()
+    test_check_contraction_lambda_min_M_tracks_gamma()
     test_estimate_lipschitz()
     print("\nAll deq_solver tests passed.")

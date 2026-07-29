@@ -320,6 +320,35 @@ class CircuitLayer(nn.Module):
         if hasattr(self.model, 'param'):
             _init_model_param(net_dict['initialization'], self.model.param)
 
+        # reparam=True devices store their parameters as raw_gain, bias, etc.
+        # (not as self.param), so the init above skipped them — leaving all
+        # values at zero, which makes gain = max_gain/2 constant and bias = 0
+        # (no dead zone), causing the circuit to be purely linear and the
+        # solver to diverge.  Init them here using the same keyword.
+        if getattr(self.model, 'reparam', False):
+            kw = net_dict['initialization']
+            for pname in ('raw_gain', 'raw_gain_src', 'raw_gain_des', 'bias'):
+                p = getattr(self.model, pname, None)
+                if p is None:
+                    continue
+                if kw == 'gauss':
+                    nn.init.normal_(p, 0.0, 0.01)
+                elif kw == 'kaiming':
+                    if p.dim() <= 1:
+                        nn.init.kaiming_normal_(p.view(1, -1))
+                        p.data.copy_(p.data.view(-1))
+                    else:
+                        nn.init.kaiming_normal_(p)
+                elif kw == 'xavier':
+                    if p.dim() <= 1:
+                        nn.init.xavier_normal_(p.view(1, -1))
+                        p.data.copy_(p.data.view(-1))
+                    else:
+                        nn.init.xavier_normal_(p)
+                elif kw == 'uniform':
+                    nn.init.uniform_(p, -0.1, 0.1)
+                # 'zeros' / 'ones': leave the initial values (already 0 / 1)
+
     @property
     def gamma(self):
         return F.softplus(self.raw_gamma) + self._gamma_floor
@@ -335,6 +364,16 @@ class CircuitLayer(nn.Module):
             if node < 1 or node > n:
                 raise ValueError(f"input_node {node} out of range [1, {n}] (1-indexed from ground)")
             S[node - 1, i] = 1.0
+        if device_index is not None and device_index >= 0 and torch.cuda.is_available():
+            S = S.to(f'cuda:{device_index}')
+        self.input_map = S
+
+    def set_input_map(self, S, device_index=None):
+        """Install a pre-built input_map of shape (n, d_in).
+
+        Used by EquilibriumBlock to install inter-layer connectivity maps
+        (shape (n_k, n_{k-1})) for layers k >= 1 in composed mode.
+        """
         if device_index is not None and device_index >= 0 and torch.cuda.is_available():
             S = S.to(f'cuda:{device_index}')
         self.input_map = S
@@ -647,9 +686,14 @@ class EquilibriumSolve(torch.autograd.Function):
 class EquilibriumBlock(nn.Module):
     """Composed-mode DEQ block: solve f_k(v_k, v_{k-1}) = 0 per layer.
 
-    Each CircuitLayer reaches its own equilibrium, receiving the previous
-    layer's equilibrium v_{k-1} as its initial condition.  Only the first
-    layer is driven by the input u.
+    Equilibria are chained: layer 0 receives the external input u, layer k
+    receives the equilibrium of layer k-1 as injected current.  The autograd
+    graph spans all layers, so every layer's parameters receive gradients.
+
+    Layer 0's input_map is built from the config's `input_nodes` and has
+    shape (n_0, d_in).  Layer k>=1's input_map has shape (n_k, n_{k-1})
+    and encodes the inter-layer connectivity (in composed mode, what was
+    implicit in sequential ODE time-integration is now explicit injection).
 
     TODO(v2): add fused mode via topology.merge_topologies for the physical
               single-equilibrium case (all layers settle simultaneously).
@@ -663,44 +707,57 @@ class EquilibriumBlock(nn.Module):
         self.input_nodes = self.input_cfg.get('input_nodes', None)
         self.last_infos = []
 
+    def _build_inter_layer_map(self, prev_layer, curr_layer):
+        """Build a (n_k, n_{k-1}) injection map for inter-layer connectivity.
+
+        Default: identity mapping for shared node indices.  If n_k > n_{k-1}
+        the extra current-injection nodes get no input (zero rows).  If
+        n_k < n_{k-1} the excess source nodes are dropped (truncated columns).
+        This matches the physical idea that the output voltages of one layer
+        become input currents to the next through a one-to-one resistive
+        interface at corresponding node indices.
+        """
+        prev_n = prev_layer.max_node_index
+        curr_n = curr_layer.max_node_index
+        S = torch.zeros(curr_n, prev_n)
+        shared = min(curr_n, prev_n)
+        for j in range(shared):
+            S[j, j] = 1.0
+        return S
+
     def prepare(self, device: List[int]) -> None:
-        for layer in self.layer_list:
+        device_index = device[0] if device[0] >= 0 else None
+        for k, layer in enumerate(self.layer_list):
             layer.prepare(device)
-            device_index = device[0] if device[0] >= 0 else None
-            layer.set_input_nodes(self.input_nodes, device_index=device_index)
+            if k == 0:
+                layer.set_input_nodes(self.input_nodes, device_index=device_index)
+            else:
+                S = self._build_inter_layer_map(self.layer_list[k - 1], layer)
+                layer.set_input_map(S, device_index=device_index)
 
     def forward(self, u, v0=None, return_middle=False):
         middle = []
         self.last_infos = []
-        last_v_star = None
         batch = u.shape[0]
         device = u.device
         dtype = u.dtype
+        prev = u
         for i, layer in enumerate(self.layer_list):
-            layer_u = u  # every layer sees u so all layer parameters receive gradients
             n = layer.max_node_index
-            if (i == 0 and v0 is not None and v0.shape[-1] == n
-                    and v0.shape[0] == batch):
-                init = v0
-            elif (last_v_star is not None and last_v_star.shape[-1] == n
-                    and last_v_star.shape[0] == batch):
-                init = last_v_star.detach()  # warm start; init enters no_grad anyway
-            else:
-                init = torch.zeros(batch, n, device=device, dtype=dtype)
+            init = torch.zeros(batch, n, device=device, dtype=dtype)
 
-            def rhs_fn(v, _u=layer_u, _layer=layer):
+            def rhs_fn(v, _u=prev, _layer=layer):
                 return _layer.rhs(v, _u)
 
-            v_star = EquilibriumSolve.apply(rhs_fn, init, layer_u, self.solver_cfg)
-            last_v_star = v_star
+            prev = EquilibriumSolve.apply(rhs_fn, init, prev, self.solver_cfg)
             info = EquilibriumSolve.last_info
             self.last_infos.append({'layer': i,
                                      'n_iter': info.get('n_iter', -1) if info else -1,
                                      'final_residual': info.get('final_residual', float('inf')) if info else float('inf'),
                                      'converged': info.get('converged', False) if info else False})
             if return_middle:
-                middle.append(v_star)
-        return (last_v_star, middle)
+                middle.append(prev)
+        return (prev, middle)
 
     def solver_stats(self):
         return list(self.last_infos)

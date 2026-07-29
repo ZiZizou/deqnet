@@ -1,0 +1,29 @@
+num_param_mib: 0.000241
+solver_stats_list:
+- - converged: true
+    final_residual: 9.834766387939453e-06
+    layer: 0
+    n_iter: 25
+- - converged: true
+    final_residual: 9.506940841674805e-06
+    layer: 0
+    n_iter: 55
+- - converged: true
+    final_residual: 8.463859558105469e-06
+    layer: 0
+    n_iter: 60
+- - converged: true
+    final_residual: 9.775161743164062e-06
+    layer: 0
+    n_iter: 47
+- - converged: true
+    final_residual: 9.059906005859375e-06
+    layer: 0
+    n_iter: 40
+test_loss: 0.018945016703313264
+train_loss_list:
+- 0.12430277765161098
+- 0.05306957139624878
+- 0.02797642554731499
+- 0.02294126959532002
+- 0.021350054664701818

@@ -171,6 +171,68 @@ def test_gradcheck_implicit_vs_unrolled():
     print("  PASS")
 
 
+def test_multi_layer_grad_flows_to_earlier_layers():
+    """Composed-mode DEQ: in a 2-layer block, layer 0's parameters must
+    receive nonzero gradient.
+
+    Before the fix, v_star was overwritten each iteration and only the last
+    layer's parameters received gradients.  After the fix, equilibria are
+    chained: layer k receives the equilibrium of layer k-1 as injected
+    current, so the autograd graph spans all layers.
+    """
+    import torch.nn as nn
+    torch.manual_seed(42)
+    topo_dict = {
+        'name': '_fully_connect',
+        'args': {'num_node': 5, 'include_gnd': True, 'repeat': [1, 0]},
+    }
+    topo = generate_topology(topo_dict)
+    circuit_dict = {
+        'model': {'name': 'ShiftRelu1', 'args': {'max_gain': 2.0, 'reparam': True}},
+        'initialization': 'kaiming',
+    }
+    layer0 = CircuitLayer(topo, circuit_dict)
+    layer1 = CircuitLayer(topo, circuit_dict)
+    layer0.prepare([-1])
+    layer1.prepare([-1])
+    # Layer 0: external input at node 1 (d_in=1).
+    layer0.set_input_nodes([1], device_index=-1)
+    # Layer 1: inter-layer map (n1, n0) = (4, 4) — identity.
+    layer1.set_input_map(torch.eye(layer1.max_node_index, layer0.max_node_index),
+                         device_index=-1)
+
+    solver_cfg = {'method': 'anderson', 'max_iter': 200, 'tol': 1e-8, 'm': 5, 'beta': 0.1,
+                  'backward_mode': 'exact', 'backward_tol': 1e-6, 'backward_max_iter': 100}
+
+    u = torch.nn.Parameter(torch.randn(3, 1) * 0.5)
+    batch = 3
+    init0 = torch.zeros(batch, layer0.max_node_index)
+
+    def rhs0(v, _u=u):
+        return layer0.rhs(v, _u)
+
+    v0_star = EquilibriumSolve.apply(rhs0, init0, u, solver_cfg)
+    init1 = torch.zeros(batch, layer1.max_node_index)
+
+    def rhs1(v, _v0=v0_star):
+        return layer1.rhs(v, _v0)
+
+    v1_star = EquilibriumSolve.apply(rhs1, init1, v0_star, solver_cfg)
+    v1_star.sum().backward()
+
+    g_layer0 = layer0.model.raw_gain.grad
+    g_layer1 = layer1.model.raw_gain.grad
+    print(f"[multi-layer grad] layer0.raw_gain.grad norm = "
+          f"{g_layer0.norm().item():.4e}, layer1 = {g_layer1.norm().item():.4e}")
+    assert g_layer0 is not None, "layer0 raw_gain.grad is None — gradient not flowing to earlier layers"
+    assert g_layer0.norm().item() > 1e-10, (
+        f"layer0 raw_gain.grad is effectively zero ({g_layer0.norm().item():.3e}); "
+        "composed multi-layer mode is degenerate."
+    )
+    assert g_layer1 is not None and g_layer1.norm().item() > 1e-10
+    print("  PASS")
+
+
 def test_linear_solve_layer_gradient_flow():
     """Regression test for the LinearSolveLayer.detach() bug.
 
@@ -226,6 +288,7 @@ if __name__ == '__main__':
     test_implicit_grad_matches_unrolled()
     test_phantom_backward_does_not_error()
     test_gradcheck_implicit_vs_unrolled()
+    test_multi_layer_grad_flows_to_earlier_layers()
     test_linear_solve_layer_gradient_flow()
     test_linear_solve_layer_matches_direct_solve()
     print("\nAll EquilibriumSolve tests passed.")

@@ -18,6 +18,7 @@ def run_all():
             test_solve_jacobian_transpose_linear,
             test_check_contraction_positive_margin,
             test_check_contraction_fails_when_gamma_zero,
+            test_check_contraction_lambda_min_M_tracks_gamma,
             test_estimate_lipschitz,
         )
         for fn in [test_linear_anderson_matches_solve,
@@ -26,6 +27,7 @@ def run_all():
                    test_solve_jacobian_transpose_linear,
                    test_check_contraction_positive_margin,
                    test_check_contraction_fails_when_gamma_zero,
+                   test_check_contraction_lambda_min_M_tracks_gamma,
                    test_estimate_lipschitz]:
             try:
                 fn()
@@ -100,6 +102,7 @@ def run_all():
             test_implicit_grad_matches_unrolled,
             test_phantom_backward_does_not_error,
             test_gradcheck_implicit_vs_unrolled,
+            test_multi_layer_grad_flows_to_earlier_layers,
             test_linear_solve_layer_gradient_flow,
             test_linear_solve_layer_matches_direct_solve,
         )
@@ -107,6 +110,7 @@ def run_all():
                    test_implicit_grad_matches_unrolled,
                    test_phantom_backward_does_not_error,
                    test_gradcheck_implicit_vs_unrolled,
+                   test_multi_layer_grad_flows_to_earlier_layers,
                    test_linear_solve_layer_gradient_flow,
                    test_linear_solve_layer_matches_direct_solve]:
             try:

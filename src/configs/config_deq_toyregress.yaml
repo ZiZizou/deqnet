@@ -24,14 +24,14 @@ solver:
   tol: 1.0e-5
   max_iter: 60
   anderson_m: 5
-  beta: 1.0
+  beta: 0.05
   backward_mode: exact
   backward_tol: 1.0e-5
   backward_max_iter: 30
 fabric:
   gamma_floor: 0.05
   max_gain: 5.0
-  input_nodes: [1, 2, 3]
+  input_nodes: [1, 2, 3, 4, 5]
   merge: composed
 test_bench: toyregress
 test:

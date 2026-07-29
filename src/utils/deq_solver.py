@@ -221,24 +221,30 @@ def solve_jacobian_transpose(
             return torch.zeros_like(y_flat)
         return g.reshape(-1).detach()
 
+    # Circuit Jacobian J = df/dv = -(B^T D B + Gamma) is symmetric NSD.
+    # CG requires the system matrix to be SPD, so we solve M y = -rhs
+    # with M = -J = B^T D B + Gamma, which is SPD.  The resulting y
+    # equals J^{-1} rhs (same answer, convergent solver).
+    M_times = lambda y_flat: -At(y_flat)
+
     y = torch.zeros_like(rhs_flat)
-    r = rhs_flat - At(y)
+    r = -rhs_flat - M_times(y)
     p = r.clone()
     rs_old = (r * r).sum().item()
     initial_resid = (r * r).sum().item() ** 0.5
     cg_failed = False
 
     for k in range(max_iter):
-        Ap = At(p)
-        pAp = (p * Ap).sum().item()
-        if abs(pAp) <= 1e-14:
+        Mp = M_times(p)
+        pMp = (p * Mp).sum().item()
+        if abs(pMp) <= 1e-14:
             return y.view_as(rhs)  # CG numerically done
-        if pAp < 0:
+        if pMp < 0:
             cg_failed = True
             break
-        alpha = rs_old / pAp
+        alpha = rs_old / pMp
         y = y + alpha * p
-        r = r - alpha * Ap
+        r = r - alpha * Mp
         rs_new = (r * r).sum().item()
         if rs_new ** 0.5 < tol * max(1.0, target_norm):
             return y.view_as(rhs)
@@ -314,16 +320,25 @@ def check_contraction(
     n_power_iter: int = 30,
     eps: float = 1e-6,
 ) -> Dict[str, float]:
-    """Cheap analytic contraction check on J_hat = -B^T D B - Gamma.
+    """Analytic certificate on J = -M where M = B^T D B + Gamma is SPD.
 
-    For small n (which covers all current test cases), we form the J matrix
-    column-by-column (each col is J @ e_i via matvec) and use
-    torch.linalg.eigvalsh to get the exact spectrum.  For larger n,
-    power iteration finds the dominant eigenvalue (correctly identifying
-    passivity when J is negative definite).
+    Reports the spectrum of the worst-case J (over input-independent slope
+    bounds).  The useful quantity is the contraction rate
+    ``lambda_min_M`` (= min eigenvalue of M = -lambda_max_J): it predicts
+    solver iteration count and the backward CG condition number.  When
+    devices saturate into dead zones, ``lambda_min_M`` -> ``gamma_floor``
+    and iteration counts blow up — that is the early-warning signal for
+    the late-training collapse described in §"known failure modes".
 
-    Returns dict with lambda_max_J and contraction_margin = -lambda_max_J.
-    If margin <= 0 the parameterization has leaked passivity.
+    Note on the legacy ``passive`` flag: with ``gamma = softplus(raw) +
+    gamma_floor`` and ``gamma_floor > 0``, ``J`` is NSD by construction,
+    so ``passive=True`` unconditionally — it certifies nothing the
+    parameterization didn't already guarantee.  The flag is retained for
+    backward compatibility but ``lambda_min_M`` is the meaningful number.
+
+    For small n (<= 128), the spectrum is computed exactly via
+    ``torch.linalg.eigvalsh``.  For larger n, power iteration on -J
+    approximates ``lambda_max_J`` (closest-to-zero eigenvalue).
     """
     n = num_nodes
     device = src_indices.device
@@ -334,36 +349,75 @@ def check_contraction(
     B[arange_e, des_indices] = 1.0
     Bn = B[:, 1:]
 
-    def matvec(v):
-        return -Bn.t() @ (worst_case_D * (Bn @ v)) - gamma_diag * v
+    def matvec_M(v):
+        """v -> M v = B^T D B v + Gamma v  (SPD)."""
+        return Bn.t() @ (worst_case_D * (Bn @ v)) + gamma_diag * v
+
+    def matvec_J(v):
+        """v -> J v = -M v."""
+        return -matvec_M(v)
 
     if n <= 128:
-        # Build J explicitly by applying matvec to each basis vector.
-        J_mat = torch.zeros((n, n), dtype=worst_case_D.dtype, device=device)
+        # Build M explicitly by applying matvec_M to each basis vector.
+        M_mat = torch.zeros((n, n), dtype=worst_case_D.dtype, device=device)
         for i in range(n):
             ei = torch.zeros(n, dtype=worst_case_D.dtype, device=device)
             ei[i] = 1.0
-            J_mat[:, i] = matvec(ei)
-        eigs = torch.linalg.eigvalsh(J_mat)
-        lam_max = eigs.max().item()
+            M_mat[:, i] = matvec_M(ei)
+        eigs_M = torch.linalg.eigvalsh(M_mat)
+        lam_min_M = eigs_M.min().item()
+        lam_max_M = eigs_M.max().item()
+        lam_max_J = (-lam_min_M)
     else:
-        # Power iteration.  Note: for NSD J, this finds the most negative
-        # eigenvalue, NOT the actual lam_max (which is closer to 0).  Use
-        # eigvalsh above when n is feasible.
+        # Power iteration on M (SPD) to get lam_max_M, and on -J=M to
+        # get lam_min_M via inverse power iteration.  For n>128 this is
+        # approximate; users needing exact values should switch to a
+        # smaller topology or use an explicit eigensolver.
         v = torch.randn(n, dtype=worst_case_D.dtype, device=device)
         v = v / (v.norm() + 1e-12)
         prev_lam = 0.0
         for _ in range(n_power_iter):
-            Mv = matvec(v)
+            Mv = matvec_M(v)
             lam = (v * Mv).sum().item()
             if abs(lam - prev_lam) < eps * max(1.0, abs(prev_lam)):
                 break
             prev_lam = lam
             v = Mv / (Mv.norm() + 1e-12)
-        Mv = matvec(v)
-        lam_max = (v * Mv).sum().item()
+        lam_max_M = (v * matvec_M(v)).sum().item()
+        # Approximate lam_min_M via inverse power iteration on M (CG
+        # on M @ x = v each step).
+        lam_min_M = float('nan')
+        v = torch.randn(n, dtype=worst_case_D.dtype, device=device)
+        v = v / (v.norm() + 1e-12)
+        try:
+            y = v.clone()
+            r = matvec_M(y) - v
+            p = r.clone()
+            rs_old = (r * r).sum().item()
+            for _ in range(n_power_iter):
+                Mp = matvec_M(p)
+                pMp = (p * Mp).sum().item()
+                if pMp <= 0:
+                    break
+                alpha = rs_old / pMp
+                y = y + alpha * p
+                r = r - alpha * Mp
+                rs_new = (r * r).sum().item()
+                if rs_new ** 0.5 < eps * max(1.0, v.norm().item()):
+                    break
+                p = r + (rs_new / (rs_old + 1e-30)) * p
+                rs_old = rs_new
+            # Rayleigh quotient on M at y approximates 1 / lam_min_M.
+            ray = (y * matvec_M(y)).sum().item() / max((y * y).sum().item(), 1e-30)
+            lam_min_M = 1.0 / max(ray, 1e-30)
+        except Exception:
+            pass
+        lam_max_J = -lam_min_M
+
     return {
-        'lambda_max_J': lam_max,
-        'contraction_margin': -lam_max,
-        'passive': lam_max < 0.0,
+        'lambda_max_J': lam_max_J,
+        'lambda_min_M': lam_min_M,
+        'lambda_max_M': lam_max_M,
+        'contraction_margin': -lam_max_J,
+        'passive': lam_max_J < 0.0,
     }

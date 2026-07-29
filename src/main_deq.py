@@ -152,7 +152,10 @@ def main():
         if epoch % contract_check_every == 0 or epoch == config['train']['num_epoch']:
             try:
                 cp = contract_check(model.module if dp_flag else model, device)
-                print(f"=== Contraction certificate: lambda_max(J_hat)={cp['lambda_max_J']:.4e}, margin={cp['contraction_margin']:.4e}, passive={cp['passive']}")
+                print(f"=== Contraction: lambda_max(J)={cp['lambda_max_J']:.4e}, "
+                      f"lambda_min(M)={cp['lambda_min_M']:.4e}, "
+                      f"lambda_max(M)={cp['lambda_max_M']:.4e}, "
+                      f"margin={cp['contraction_margin']:.4e}")
                 if not cp['passive']:
                     print("!!! WARNING: parameterization leaked passivity (lambda_max >= 0)")
             except Exception as e:
