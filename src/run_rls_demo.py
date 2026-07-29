@@ -42,22 +42,17 @@ sys.path.insert(0, THIS_DIR)
 from utils.circuit_block import LinearSolveLayer
 
 
-def _resolve_device(gpu_arg):
-    """Resolve --gpu flag to a torch.device.
+def _resolve_device(use_gpu, gpu_id):
+    """Resolve --gpu / --gpu_id flags to a torch.device.
 
-    -1  : auto — use 'cuda' if any GPU available, else 'cpu'
-     0+ : cuda:<gpu> if available, else raise
-    -2  : force CPU
+    use_gpu=False            -> CPU
+    use_gpu=True, gpu_id>=0  -> cuda:<gpu_id> (raise if CUDA unavailable)
     """
-    if gpu_arg == -2:
+    if not use_gpu:
         return torch.device('cpu')
-    if gpu_arg >= 0:
-        if not torch.cuda.is_available():
-            raise RuntimeError(f"--gpu {gpu_arg} requested but CUDA is not available")
-        return torch.device(f'cuda:{gpu_arg}')
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    return torch.device('cpu')
+    if not torch.cuda.is_available():
+        raise RuntimeError("--gpu set but CUDA is not available")
+    return torch.device(f'cuda:{gpu_id}')
 
 
 # ----------------------------------------------------------------------------
@@ -445,7 +440,7 @@ def run_experiment(args):
     dtype = torch.float64
 
     # ---- Device selection ----
-    device = _resolve_device(args.gpu)
+    device = _resolve_device(args.gpu, args.gpu_id)
     if device.type == 'cuda':
         torch.cuda.manual_seed(args.seed)
         gpu_name = torch.cuda.get_device_name(device.index)
@@ -591,9 +586,11 @@ def parse_args():
     parser.add_argument('--process_std', type=float, default=1e-3)
     parser.add_argument('--tracking_lambdas', type=float, nargs='+',
                         default=[0.90, 0.95, 0.98, 0.99, 0.995, 0.999])
-    parser.add_argument('--gpu', type=int, default=-1,
-                        help="Device selector: -1 = auto (use CUDA if available, else CPU), "
-                             "0+ = use cuda:<gpu>, -2 = force CPU.")
+    parser.add_argument('--gpu', action='store_true',
+                        help="Use CUDA. Default is CPU. Pairs with --gpu_id to select "
+                             "which GPU (default 0).")
+    parser.add_argument('--gpu_id', type=int, default=0,
+                        help="GPU index when --gpu is set. Ignored otherwise.")
     return parser.parse_args()
 
 
