@@ -143,6 +143,35 @@ def run_all():
         failed.append("test_deq_end_to_end import")
 
     print()
+    try:
+        from tests.test_batch_rls import (
+            test_batch_accumulation_shapes_and_spd,
+            test_batch_fabric_matches_lstsq,
+            test_batch_single_settle_invocation,
+            test_batch_deterministic_with_seed,
+            test_batch_lstsq_reference_matches_augmented_system,
+            test_batch_weight_consistency,
+            test_batch_objective_matches_lstsq_minimizer,
+            test_batch_r_is_symmetric_after_accumulate,
+        )
+        for fn in [test_batch_accumulation_shapes_and_spd,
+                   test_batch_fabric_matches_lstsq,
+                   test_batch_single_settle_invocation,
+                   test_batch_deterministic_with_seed,
+                   test_batch_lstsq_reference_matches_augmented_system,
+                   test_batch_weight_consistency,
+                   test_batch_objective_matches_lstsq_minimizer,
+                   test_batch_r_is_symmetric_after_accumulate]:
+            try:
+                fn()
+            except AssertionError as e:
+                print(f"  FAIL: {fn.__name__}: {e}")
+                failed.append(fn.__name__)
+    except Exception as e:
+        print(f"  IMPORT FAIL test_batch_rls: {e}")
+        failed.append("test_batch_rls import")
+
+    print()
     if failed:
         print(f"!!! {len(failed)} tests failed:")
         for n in failed:

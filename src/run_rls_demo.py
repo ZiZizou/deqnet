@@ -40,7 +40,7 @@ import torch
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, THIS_DIR)
 
-from utils.circuit_block import LinearSolveLayer
+from utils.circuit_block import LinearSolveLayer, EquilibriumSolve
 
 
 def _resolve_device(use_gpu, gpu_id):
@@ -179,6 +179,121 @@ class FabricRLS:
             print(f"    [{self.log_name}] sample {self._step_count}"
                   f"  LinearSolveLayer iters={n_iters}", flush=True)
         return self.w.clone()
+
+
+class FabricBatchRLS:
+    """Block/batch least-squares via a single fabric equilibrium solve.
+
+    Given a block of observations X and d, accumulate the (regularized,
+    uniformly-weighted) normal equations R w = p, then compute w* by
+    invoking LinearSolveLayer exactly once.  The accumulated system
+    corresponds to the least-squares problem
+
+        w* = argmin  weight * ||X w - d||^2  +  w^T R0 w
+
+    whose normal equations are  (weight * X^T X + R0) w = weight * X^T d.
+    The scalar ``weight`` (default 1.0) is a uniform per-sample weight; it
+    is not a forgetting factor and does not change the unweighted
+    solution when set to 1.  R0 is the positive-definite regularizer
+    (default identity).
+    """
+    def __init__(self, d, R0=None, weight=1.0, max_iter=200, tol=1e-10,
+                 beta='chebyshev', device='cpu'):
+        self.d = d
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        self.R = (R0.to(self.device) if R0 is not None
+                  else torch.eye(d, device=self.device))
+        self.p = torch.zeros(d, device=self.device)
+        self.weight = float(weight)
+        self.max_iter = max_iter
+        self.tol = tol
+        self.beta_mode = beta
+
+    def _chebyshev_beta(self, R):
+        eigs = torch.linalg.eigvalsh(R)
+        lam_min = eigs[0].item()
+        lam_max = eigs[-1].item()
+        if lam_max <= 0:
+            return 1.0
+        return float(2.0 / (lam_min + lam_max))
+
+    def accumulate(self, X, d):
+        """Accumulate one block: X is (T, d), d is (T,)."""
+        X = X.to(self.device)
+        d = d.to(self.device)
+        R_new = self.R + self.weight * (X.t() @ X)
+        # Symmetrize to remove fp-rounding asymmetry before any further
+        # eigendecomposition, beta computation, or solve.
+        self.R = 0.5 * (R_new + R_new.t())
+        self.p = self.p + self.weight * (X.t() @ d)
+
+    def _solve_beta(self):
+        if self.beta_mode == 'chebyshev':
+            return self._chebyshev_beta(self.R)
+        return float(self.beta_mode)
+
+    def solve(self):
+        """One settle: w* = R^{-1} p via LinearSolveLayer."""
+        beta = self._solve_beta()
+        layer = LinearSolveLayer(max_iter=self.max_iter, tol=self.tol, beta=beta)
+        w_star = layer(self.p.unsqueeze(0), self.R).squeeze(0)
+        info = EquilibriumSolve.last_info
+        return w_star, info
+
+
+def batch_lstsq_reference(X, d, R0, weight=1.0):
+    """Direct reference for the uniformly-weighted regularized
+    least-squares problem:
+
+        w* = argmin  weight * ||X w - d||^2  +  w^T R0 w
+           = lstsq([sqrt(weight) * X; L], [sqrt(weight) * d; 0]).solution
+
+    where R0 = L^T L.  For scalar identity regularization R0 = delta I,
+    L = sqrt(delta) * I.  Returns w_ref on the same device as X.  When
+    ``weight=1`` this matches the unweighted reference documented in the
+    spec.
+    """
+    weight = float(weight)
+    device = X.device
+    n = X.shape[1]
+    R0 = R0.to(device)
+    sw = float(np.sqrt(max(weight, 0.0)))
+    eigs, Q = torch.linalg.eigh(R0)
+    L = Q @ torch.diag(torch.sqrt(eigs.clamp_min(0.0))) @ Q.t()
+    A = torch.cat([sw * X, L], dim=0)
+    rhs = torch.cat([sw * d, torch.zeros(n, device=device, dtype=d.dtype)])
+    sol, *_ = torch.linalg.lstsq(A, rhs)
+    return sol
+
+
+def batch_experiment_metrics(w_fabric, R, p, X, d, R0, w_o=None, weight=1.0):
+    """Compare fabric and reference solutions for the same weighted
+    regularized least-squares problem.  Returns a dict of metrics plus the
+    reference solution.  ``weight`` defaults to 1.0 for the unweighted
+    problem; the metric definitions use the same weight the fabric solve
+    accumulated, so a fabric/reference mismatch can only come from solver
+    inaccuracy.
+    """
+    weight = float(weight)
+    w_ref = batch_lstsq_reference(X, d, R0, weight=weight)
+    abs_err = (w_fabric - w_ref).abs().max().item()
+    rel_err = ((w_fabric - w_ref).norm() / w_ref.norm().clamp_min(1e-12)).item()
+    normal_res = (R @ w_fabric - p).norm().item()
+    # The objective actually being minimized by both fabric and reference
+    # (no arbitrary 0.5 scaling).
+    obj = (weight * (X @ w_fabric - d).pow(2).sum()
+           + w_fabric @ R0 @ w_fabric).item()
+    out = {
+        'abs_err': abs_err,
+        'rel_err': rel_err,
+        'normal_eq_residual': normal_res,
+        'regularized_objective': obj,
+        'w_ref': w_ref.detach().cpu(),
+        'w_fabric': w_fabric.detach().cpu(),
+    }
+    if w_o is not None:
+        out['plant_error'] = (w_fabric - w_o).pow(2).sum().item()
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -465,6 +580,119 @@ def plot_ljung_overlay(out_dir, w_o, x, d_obs, mu_values, dt_values):
 # 7. Main experiment flow
 # ----------------------------------------------------------------------------
 
+def run_batch_experiment(args, out_dir, w_o, device, dtype, seed):
+    """Single-block batch least-squares experiment.
+
+    Accumulate one block of observations into the regularized normal
+    equations, solve once via LinearSolveLayer, compare to a direct
+    torch.linalg.lstsq reference on the same regularized objective,
+    and save metrics + solution snapshots.
+    """
+    print(f"\n=== Batch experiment: T={args.T_batch}, d={args.d}, "
+          f"sigma={args.sigma}, regularization delta={args.batch_delta}, "
+          f"weight={args.batch_weight}, n_trials={args.n_trials} ===",
+          flush=True)
+    fabric_ws = []
+    ref_ws = []
+    metrics_all = []
+    n_calls = 0
+    for trial in range(args.n_trials):
+        torch.manual_seed(seed + trial)
+        if device.type == 'cuda':
+            torch.cuda.manual_seed(seed + trial)
+        g = torch.Generator(device=device).manual_seed(seed + trial)
+        x = torch.randn(args.T_batch, args.d, generator=g, dtype=dtype, device=device)
+        nu = args.sigma * torch.randn(args.T_batch, generator=g, dtype=dtype, device=device)
+        d_obs = x @ w_o + nu
+
+        R0 = args.batch_delta * torch.eye(args.d, device=device, dtype=dtype)
+        solver = FabricBatchRLS(d=args.d, R0=R0, weight=args.batch_weight,
+                                max_iter=args.linear_max_iter, tol=args.linear_tol,
+                                beta=args.linear_beta, device=device)
+        solver.accumulate(x, d_obs)
+        # Accumulate() already symmetrizes self.R; use it directly.
+
+        # Snapshot EquilibriumSolve.last_info before the solve, then verify
+        # it was replaced by a new info dict after exactly one solve call.
+        info_before = EquilibriumSolve.last_info
+        w_fabric, info = solver.solve()
+        n_calls += 1
+        if info is None:
+            raise RuntimeError("LinearSolveLayer did not produce an info dict")
+        if info_before is not None and info_before is EquilibriumSolve.last_info:
+            raise RuntimeError(
+                "FabricBatchRLS.solve() did not update EquilibriumSolve.last_info"
+            )
+
+        m = batch_experiment_metrics(w_fabric, solver.R, solver.p, x, d_obs, R0,
+                                     w_o=w_o, weight=args.batch_weight)
+        m['trial'] = trial
+        m['settle_n_iter'] = info.get('n_iter', -1)
+        m['settle_final_residual'] = info.get('final_residual', float('nan'))
+        m['settle_converged'] = bool(info.get('converged', False))
+        metrics_all.append(m)
+        fabric_ws.append(w_fabric.detach().cpu())
+        ref_ws.append(m['w_ref'])
+        print(f"  trial {trial + 1}/{args.n_trials}"
+              f"  settle_iters={m['settle_n_iter']}"
+              f"  rel_err={m['rel_err']:.3e}"
+              f"  normal_eq_res={m['normal_eq_residual']:.3e}"
+              f"  plant_err={m.get('plant_error', float('nan')):.3e}",
+              flush=True)
+
+    fabric_stack = torch.stack(fabric_ws, dim=0)
+    ref_stack = torch.stack(ref_ws, dim=0)
+    summary = {
+        'd': args.d,
+        'T_block': args.T_batch,
+        'sigma': args.sigma,
+        'n_trials': args.n_trials,
+        'batch_delta': args.batch_delta,
+        'batch_weight': args.batch_weight,
+        'seed': seed,
+        'device': str(device),
+        'solver': {
+            'method': 'anderson',
+            'max_iter': args.linear_max_iter,
+            'tol': args.linear_tol,
+            'beta': args.linear_beta,
+        },
+        'aggregate': {
+            'rel_err_max': float(max(m['rel_err'] for m in metrics_all)),
+            'rel_err_mean': float(np.mean([m['rel_err'] for m in metrics_all])),
+            'abs_err_max': float(max(m['abs_err'] for m in metrics_all)),
+            'normal_eq_residual_max': float(max(m['normal_eq_residual'] for m in metrics_all)),
+            'plant_error_mean': float(np.mean([m.get('plant_error', float('nan'))
+                                               for m in metrics_all])),
+            'settle_n_iter_mean': float(np.mean([m['settle_n_iter']
+                                                 for m in metrics_all])),
+            'settle_n_iter_max': int(max(m['settle_n_iter']
+                                          for m in metrics_all)),
+            'all_converged': bool(all(m['settle_converged'] for m in metrics_all)),
+            'n_equilibrium_calls': n_calls,
+        },
+        'trials': [{k: (float(v) if isinstance(v, (np.floating, float))
+                        else int(v) if isinstance(v, (np.integer, int))
+                        else bool(v) if isinstance(v, (np.bool_, bool))
+                        else v)
+                    for k, v in m.items()
+                    if k not in ('w_ref', 'w_fabric')}
+                   for m in metrics_all],
+    }
+    np.savez(os.path.join(out_dir, 'batch_solutions.npz'),
+             w_fabric=fabric_stack.numpy(),
+             w_ref=ref_stack.numpy(),
+             w_o=w_o.detach().cpu().numpy())
+    with open(os.path.join(out_dir, 'batch_metrics.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f"  [batch] n_equilibrium_calls={n_calls}"
+          f"  rel_err_mean={summary['aggregate']['rel_err_mean']:.3e}"
+          f"  rel_err_max={summary['aggregate']['rel_err_max']:.3e}"
+          f"  settle_iters_mean={summary['aggregate']['settle_n_iter_mean']:.2f}")
+    print(f"  Wrote {out_dir}/batch_metrics.json and batch_solutions.npz")
+    return summary
+
+
 def run_experiment(args):
     out_dir = _ensure_dir(args.out_dir)
     torch.set_default_dtype(torch.float64)
@@ -484,6 +712,10 @@ def run_experiment(args):
     w_o = torch.randn(args.d, generator=g, dtype=dtype, device=device)
     w_o = w_o / w_o.norm()  # unit-norm plant
     print(f"True plant ||w_o|| = {w_o.norm().item():.4f}, d = {args.d}")
+
+    if args.batch_only:
+        run_batch_experiment(args, out_dir, w_o, device, dtype, args.seed)
+        return
 
     # ---- 4 contenders ----
     def digital_lms_factory():
@@ -650,6 +882,24 @@ def parse_args():
     parser.add_argument('--fabric_rls_log_every', type=int, default=0,
                         help="Log FabricRLS settling-iter count every N samples "
                              "(0 = silent, default). Useful for diagnosing solver cost.")
+    parser.add_argument('--batch_only', action='store_true',
+                        help="Run only the block/batch least-squares experiment "
+                             "(single settle via LinearSolveLayer vs torch.linalg.lstsq). "
+                             "Skips the streaming iid/AR(1)/tracking/Ljung experiments.")
+    parser.add_argument('--T_batch', type=int, default=512,
+                        help="Block size for the batch experiment (number of samples "
+                             "accumulated into one normal-equation system).")
+    parser.add_argument('--batch_delta', type=float, default=1e-2,
+                        help="Identity regularization strength for the batch "
+                             "experiment's R0 = delta * I.  Ensures R is SPD and "
+                             "matches between fabric solve and the direct "
+                             "lstsq reference.")
+    parser.add_argument('--batch_weight', type=float, default=1.0,
+                        help="Uniform per-sample weight for batch accumulation.  "
+                             "1.0 reproduces the unweighted normal equations; "
+                             "the solved problem becomes argmin weight*||Xw-d||^2 "
+                             "+ w^T R0 w (a uniform-weight least-squares variant, "
+                             "not a forgetting factor).")
     return parser.parse_args()
 
 

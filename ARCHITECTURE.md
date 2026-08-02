@@ -440,8 +440,42 @@ composed mode.
 ### 5.3  LinearSolveLayer (SPD building block)
 
 Solves `f(w) = p - R w = 0` where `R` is SPD.  Forward is Anderson; backward
-uses the same CG machinery.  This is the core of the streaming RLS demo (not
-yet written).
+uses the same CG machinery.  This is the core of the streaming RLS demo and
+the batch least-squares experiment in `run_rls_demo.py`.
+
+#### 5.3.1  Streaming/online mode (existing)
+
+`FabricRLS` accumulates the regularized normal equations per sample and
+settles once per sample via `LinearSolveLayer`:
+
+```text
+R <- lambda * R + outer(x_t, x_t)
+p <- lambda * p + d_t * x_t
+w  = LinearSolveLayer(p, R)        # one analog settle per sample
+```
+
+This is the per-sample inner solve; iteration count is the cost paid per
+sample.
+
+#### 5.3.2  Batch/block equilibrium mode (added)
+
+For block-structured problems (training sequences, decision-directed
+blocks, per-packet adaptation), `FabricBatchRLS` accumulates an entire
+block first and then settles exactly once:
+
+```text
+R = R0 + X^T X          # R0 = delta * I by default
+p = X^T d
+w* = LinearSolveLayer(p, R)       # ONE settle -> w* = R^{-1} p
+```
+
+The fabric solution is verified against a direct `torch.linalg.lstsq`
+reference on the same regularized objective
+`argmin ||Xw - d||^2 + w^T R0 w`.  This is the strongest claim: the
+algorithm's *limit point* is read off the settled node voltages directly,
+without per-sample overhead.  Selectable via `--batch_only`; artifacts
+written to `results/rls_demo/batch_metrics.json` and `batch_solutions.npz`.
+Regression tests live in `src/tests/test_batch_rls.py`.
 
 ---
 
@@ -685,18 +719,12 @@ warm-start init), making the autograd chain differentiable across layers.
 
 ### 9.3  Streaming RLS demo (medium priority)
 
-`LinearSolveLayer` is implemented and tested, but the full streaming RLS
-adaptive-filtering demo script (`run_rls_demo.py`) does not exist:
-
-```
-for (x_t, d_t) in stream:
-    R = decay * R + outer(x_t, x_t)     # conductance update (write phase)
-    p = decay * p + e_t * x_t           # current-source update
-    w = LinearSolveLayer(p, R)          # settle phase (the fabric)
-    e_{t+1} = d_{t+1} - w @ x_{t+1}
-```
-
-Requires baselines: digital RLS, LMS, analog-LMS first-order fabric.
+Streaming mode is implemented in `run_rls_demo.py` (`FabricRLS`):
+per-sample accumulation of the regularized normal equations and one
+`LinearSolveLayer` settle per sample.  The batch mode (block equilibrium,
+single settle) is implemented in `FabricBatchRLS` and selected via the
+`--batch_only` CLI flag.  See §5.3.2 for the batch contract and
+`src/tests/test_batch_rls.py` for the regression tests.
 
 ### 9.4  Jacobian regularizer (low priority)
 
