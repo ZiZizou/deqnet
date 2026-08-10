@@ -585,9 +585,19 @@ class EquilibriumSolve(torch.autograd.Function):
     forward: solve f(v, u) = 0 via Anderson (or fixed-point fallback),
              starting from v0.  No autograd graph is built.
 
-    backward: re-run rhs_fn with enable_grad, then call .backward(-y) on the
+    backward: re-run rhs_fn with enable_grad, then call f_.backward(y) on the
              residual f_, where y solves J^T y = grad_out.  This populates
              .grad on all parameters that participated in the closure.
+
+    At least one of the explicit Function inputs (v0 or u) must require
+    grad; otherwise the output has no grad_fn and backward is never
+    invoked, so closure-captured parameters cannot receive gradients.
+
+    When the closure-captured graph and u's graph share non-leaf nodes
+    (e.g. when both p and R are derived from the same learned weighter),
+    the inner f_.backward must use retain_graph=True so the shared
+    nodes' saved tensors survive the subsequent outer traversal via
+    the returned u_grad.
 
     backward_mode:
         'exact'   — full CG/fixed-point on J^T y = grad_out  (default, expensive)
@@ -615,16 +625,12 @@ class EquilibriumSolve(torch.autograd.Function):
                                              max_iter=max_iter, tol=tol, **fwd_kwargs)
             else:
                 raise ValueError(f"Unknown solver method: {method!r}")
-        # Detach + require_grad so the autograd graph can flow even when no
-        # input tensor had requires_grad=True (typical for downstream users).
         ctx.rhs_fn = rhs_fn
         ctx.v_star = v_star
         ctx.u = u
         ctx.solver_cfg = solver_cfg if solver_cfg is not None else {}
         ctx.info = info
         EquilibriumSolve.last_info = info
-        if not v_star.requires_grad:
-            v_star = v_star.detach().requires_grad_(True)
         return v_star
 
     @staticmethod
@@ -677,7 +683,12 @@ class EquilibriumSolve(torch.autograd.Function):
 
         if v_.grad is None:
             v_.grad = torch.zeros_like(v_)
-        f_.backward(gradient=y, retain_graph=False)
+        # retain_graph=True: when u's graph shares non-leaf nodes with the
+        # closure-captured graph (e.g. p and R both derived from the same
+        # weighter), the inner traversal here and the outer traversal via
+        # u_grad must both reach those nodes.  Autograd frees saved tensors
+        # on backward; without retain, the second traversal errors.
+        f_.backward(gradient=y, retain_graph=True)
 
         u_grad = u_.grad if u_ is not None else None
         return None, None, u_grad, None
