@@ -18,16 +18,29 @@ where  R_t = sum_{k<=t} lambda^{t-k} x_k x_k^T  and  p_t = sum_{k<=t} lambda^{t-
 Note the *observation* d_k enters p, not the error e_k.  The README's earlier
 p <- decay*p + e*x sketch was wrong; this is the correct form.
 
+Phase 1 (Learned Robust IR-RLS) extends the four contenders with two
+robust variants whose per-sample influence v_t is gated by a learned
+robust weighter.  See ``utils/learned_robust.py`` and the
+``LEARNED_RLS_ISTA_PLAN.md`` file.
+
+Precision policy (plan decision 0b / 8):
+  * Training the robust weighter runs in float32 on CPU (solver tol
+    1e-5, max_iter ~ 50).  The grad plumbing is exercised in float64
+    in ``tests/test_learned_robust.py`` (Phase 0 gate).
+  * Evaluation (the Monte-Carlo comparison) runs in float64; the
+    frozen weighter is ``.double()``-cast for that run.
+  * Parity / gradcheck gates run in float64 (solver tol 1e-10) to
+    isolate algorithmic error from precision error.
+
 Metrics:
   - Ensemble-mean ||w_t - w_o||^2 vs t (log scale), all 4 contenders on one plot
   - Discrepancy: ||w_fabric - w_digital_RLS|| / ||w_digital_RLS|| vs t (should be 1e-4..1e-6)
   - Settling budget: iterations per sample for LinearSolveLayer
   - Tracking: time-varying w_o with process noise, steady-state misadjustment vs lambda
+  - Ljung overlay: fabric-LMS (ODE dw/dt = mu*e*x) and digital
+    LMS at decreasing step sizes mu*dt converge onto the continuous trajectory.
 
-Also produces the Ljung overlay: fabric-LMS (ODE dw/dt = mu*e*x) and digital
-LMS at decreasing step sizes mu*dt converge onto the continuous trajectory.
-
-Results are saved to ./results/rls_demo/.
+Results are saved to ./results/rls_demo/ (and ./results/rls_demo/robust/ for Phase 1).
 """
 import os
 import sys
@@ -36,6 +49,7 @@ import json
 import time
 import numpy as np
 import torch
+
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, THIS_DIR)
@@ -136,10 +150,17 @@ class FabricRLS:
         self.d = d
         self.lam = lam
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
-        self.R = (R0.to(self.device) if R0 is not None else torch.eye(d, device=self.device))
-        self.w = (torch.zeros(d, device=self.device) if w_init is None
+        # Match dtype to R0 if provided; otherwise default.
+        if R0 is not None:
+            self._init_dtype = R0.dtype
+        elif w_init is not None:
+            self._init_dtype = w_init.dtype
+        else:
+            self._init_dtype = torch.get_default_dtype()
+        self.R = R0.to(self.device) if R0 is not None else torch.eye(d, device=self.device, dtype=self._init_dtype)
+        self.w = (torch.zeros(d, device=self.device, dtype=self._init_dtype) if w_init is None
                   else w_init.clone().to(self.device))
-        self.p = torch.zeros(d, device=self.device)
+        self.p = torch.zeros(d, device=self.device, dtype=self._init_dtype)
         self.max_iter = max_iter
         self.tol = tol
         self.beta_mode = beta
@@ -283,28 +304,51 @@ def batch_experiment_metrics(w_fabric, R, p, X, d, R0, w_o=None, weight=1.0):
     # (no arbitrary 0.5 scaling).
     obj = (weight * (X @ w_fabric - d).pow(2).sum()
            + w_fabric @ R0 @ w_fabric).item()
-    out = {
-        'abs_err': abs_err,
-        'rel_err': rel_err,
-        'normal_eq_residual': normal_res,
-        'regularized_objective': obj,
-        'w_ref': w_ref.detach().cpu(),
-        'w_fabric': w_fabric.detach().cpu(),
-    }
-    if w_o is not None:
-        out['plant_error'] = (w_fabric - w_o).pow(2).sum().item()
-    return out
-
-
 # ----------------------------------------------------------------------------
 # 2. Stream generators
 # ----------------------------------------------------------------------------
 
-def make_stream(w_o, T, sigma, mode='iid', seed=0, dtype=torch.float64, device='cpu'):
+def _make_noise(T, sigma, mode='gaussian', p_burst=0.02, kappa=20.0,
+                generator=None, dtype=torch.float64, device='cpu'):
+    """Per-sample additive noise nu_t.
+
+    mode='gaussian':
+        nu_t = sigma * randn(T)                       # byte-identical to the
+        legacy ``make_stream`` noise (default).
+    mode='impulsive':
+        nu_t = sigma * (randn(T) + kappa * burst_t * randn(T))
+        burst_t = (rand(T) < p_burst)               # Bernoulli gate
+        # Equivalent: nu_t = sigma * (1 + kappa * burst_t) * randn(T) when the
+        # burst is on, sigma * randn(T) otherwise.  The two-form factor
+        # (randn + kappa * burst * randn) keeps the noise scale *per sample*
+        # interpretable: nominal |nu| ~ sigma, burst |nu| ~ sigma * sqrt(1 + kappa^2).
+
+    ``generator`` is the torch.Generator used to draw the randn and rand
+    tensors; passing an explicit generator keeps the noise deterministic
+    for a given seed (plan decision 6: backward-compatible defaults).
+    """
+    if mode == 'gaussian':
+        return sigma * torch.randn(T, generator=generator, dtype=dtype, device=device)
+    if mode == 'impulsive':
+        z1 = torch.randn(T, generator=generator, dtype=dtype, device=device)
+        z2 = torch.randn(T, generator=generator, dtype=dtype, device=device)
+        # Use a separate rand stream for the burst gate so the impulsive
+        # noise is reproducible from the same seed (gate 5 checks this).
+        burst = (torch.rand(T, generator=generator, dtype=dtype, device=device) < p_burst).to(dtype)
+        return sigma * (z1 + kappa * burst * z2)
+    raise ValueError(f"unknown noise mode: {mode!r}")
+
+
+def make_stream(w_o, T, sigma, mode='iid', noise='gaussian', p_burst=0.02,
+                kappa=20.0, seed=0, dtype=torch.float64, device='cpu'):
     """Generate (x_t, d_t) stream of length T.
 
     mode='iid':   x_t ~ N(0, I)
     mode='ar1':   x_t = rho * x_{t-1} + sqrt(1-rho^2) * eps_t, eps_t ~ N(0, I)
+
+    noise='gaussian':  nu_t = sigma * randn(T)                   legacy / default
+    noise='impulsive': nu_t = sigma * (randn + kappa * burst * randn)
+    with burst_t = (rand < p_burst).  All backward-compatible defaults.
     """
     device = torch.device(device) if not isinstance(device, torch.device) else device
     g = torch.Generator(device=device).manual_seed(seed)
@@ -320,7 +364,8 @@ def make_stream(w_o, T, sigma, mode='iid', seed=0, dtype=torch.float64, device='
             x[t] = rho * x[t - 1] + np.sqrt(1 - rho ** 2) * eps[t]
     else:
         raise ValueError(f"unknown mode: {mode}")
-    nu = sigma * torch.randn(T, generator=g, dtype=dtype, device=device)
+    nu = _make_noise(T, sigma, mode=noise, p_burst=p_burst, kappa=kappa,
+                     generator=g, dtype=dtype, device=device)
     d_obs = x @ w_o + nu
     return x, d_obs
 
@@ -364,23 +409,29 @@ def run_trial(contender, x, d_obs, w_o):
 # ----------------------------------------------------------------------------
 
 def monte_carlo(contender_factory, w_o, T, sigma, n_trials,
-                 mode='iid', seed_base=0, dtype=torch.float64, device='cpu',
+                 mode='iid', noise='gaussian', p_burst=0.02, kappa=20.0,
+                 seed_base=0, dtype=torch.float64, device='cpu',
                  name='', log_every=1, quiet=False):
     """`contender_factory` is a zero-arg callable returning a fresh contender
     instance.  Returns (W_mean[T,d], W_runs[n_trials, T, d], per-trial extras list).
 
     `name` and `log_every` control progress logging: prints every `log_every`
     trials with the elapsed wall time.  Set `quiet=True` to suppress all logging
-    (used when called from inside another logged loop)."""
+    (used when called from inside another logged loop).
+
+    ``noise``/``p_burst``/``kappa`` are forwarded to ``make_stream`` /
+    ``_make_noise`` (plan decision 6: backwards-compatible defaults)."""
     device = torch.device(device) if not isinstance(device, torch.device) else device
     d = w_o.shape[0]
     W_runs = torch.zeros(n_trials, T, d, dtype=dtype, device=device)
     extras_all = []
     if not quiet:
-        print(f"  [{name}] {n_trials} trials, T={T}, mode={mode}", flush=True)
+        print(f"  [{name}] {n_trials} trials, T={T}, mode={mode}, noise={noise}"
+              f" (p_burst={p_burst}, kappa={kappa})", flush=True)
     loop_start = time.time()
     for trial in range(n_trials):
-        x, d_obs = make_stream(w_o, T, sigma, mode=mode,
+        x, d_obs = make_stream(w_o, T, sigma, mode=mode, noise=noise,
+                               p_burst=p_burst, kappa=kappa,
                                seed=seed_base + trial, dtype=dtype, device=device)
         contender = contender_factory()
         W, extras = run_trial(contender, x, d_obs, w_o)
@@ -711,11 +762,14 @@ def run_experiment(args):
     g = torch.Generator(device=device).manual_seed(args.seed)
     w_o = torch.randn(args.d, generator=g, dtype=dtype, device=device)
     w_o = w_o / w_o.norm()  # unit-norm plant
-    print(f"True plant ||w_o|| = {w_o.norm().item():.4f}, d = {args.d}")
-
     if args.batch_only:
         run_batch_experiment(args, out_dir, w_o, device, dtype, args.seed)
         return
+
+    if args.train_robust:
+        run_robust_experiment(args, out_dir, w_o, device, dtype, args.seed)
+        return
+
 
     # ---- 4 contenders ----
     def digital_lms_factory():
@@ -752,6 +806,8 @@ def run_experiment(args):
         W_mean, _, extras = monte_carlo(factory_wrapped,
                                        w_o, args.T, args.sigma,
                                        args.n_trials, mode='iid',
+                                       noise=args.noise, p_burst=args.p_burst,
+                                       kappa=args.kappa,
                                        seed_base=args.seed, dtype=dtype, device=device,
                                        name=f'iid/{name}',
                                        log_every=max(1, args.n_trials // 5))
@@ -788,6 +844,8 @@ def run_experiment(args):
         W_mean, _, _ = monte_carlo(factory_wrapped,
                                    w_o, args.T, args.sigma,
                                    args.n_trials, mode='ar1',
+                                   noise=args.noise, p_burst=args.p_burst,
+                                   kappa=args.kappa,
                                    seed_base=args.seed, dtype=dtype, device=device,
                                    name=f'ar1/{name}',
                                    log_every=max(1, args.n_trials // 5))
@@ -855,6 +913,367 @@ def run_experiment(args):
     print(f"Figures in {out_dir}/")
 
 
+# ----------------------------------------------------------------------------
+# 8. Phase 1: Learned Robust IR-RLS
+# ----------------------------------------------------------------------------
+
+def train_robust_weighter(d, *, epochs=80, T=128, lam=0.99, sigma=0.01,
+                          p_burst=0.02, kappa=20.0, device='cpu',
+                          lr=1e-2, truncate_every=32, linear_max_iter=50,
+                          linear_tol=1e-5, seed=0, log_every=10,
+                          save_path=None, return_history=False):
+    """Train a ``LearnedRobustWeighter`` end-to-end on impulsive noise.
+
+    Per plan decision 7 (and KIMI correction #1):
+      * Per-epoch randomized plant w_o (unit norm).
+      * T=128 samples, prequential MSE
+          L_pre  = sum_t (d_{t+1} - w_t^T x_{t+1})^2
+        plus a terminal loss
+          L_term = 10 * ||w_T - w_o||^2.
+      * Truncation every ``truncate_every`` samples detaches R, p, AND w
+        (decision 4, finding D).
+      * Adam optimizer; raw_c init = -2.25 (c ~ 0.107, putting the knee
+        between nominal sigma ~ 0.01 and burst magnitude ~ kappa * sigma
+        ~ 0.2; KIMI correction #1).
+
+    Precision policy (0b / 8): float32 CPU throughout, solver tol 1e-5,
+    max_iter ~ 50.
+
+    Returns the trained weighter (in ``eval()`` mode).  When
+    ``return_history=True``, also returns a list of dicts with per-epoch
+    metrics (loss, terminal-error, c, alpha).
+    """
+    # Lazy import to avoid the circular dependency (plan decision 9).
+    from utils.learned_robust import FabricRobustRLS, LearnedRobustWeighter
+
+    torch.manual_seed(seed)
+    weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0).to(device)
+    optimizer = torch.optim.Adam(weighter.parameters(), lr=lr)
+    history = []
+
+    for epoch in range(epochs):
+        # Random unit-norm plant per epoch; orthogonal adversarial-physics
+        # to the burst signal so the weighter learns the *physics* of
+        # bursting, not w_o itself.
+        w_o = torch.randn(d, device=device, dtype=torch.float32)
+        w_o = w_o / w_o.norm()
+
+        # Train in float32 (decision 0b / 8).
+        x, d_obs = make_stream(w_o, T, sigma, mode='iid',
+                               noise='impulsive', p_burst=p_burst,
+                               kappa=kappa, seed=seed + epoch,
+                               dtype=torch.float32, device=device)
+
+        R0 = torch.eye(d, device=device, dtype=torch.float32)
+        filter = FabricRobustRLS(d=d, weighter=weighter, lam=lam,
+                                  R0=R0,
+                                  max_iter=linear_max_iter, tol=linear_tol,
+                                  beta='chebyshev', device=device,
+                                  training=True, log_every=0)
+
+        loss_preq = torch.zeros((), device=device)
+        for t in range(T):
+            # Prequential error: w_t (with graph) predicts sample t.
+            e_t = d_obs[t] - filter.w @ x[t]
+            loss_preq = loss_preq + e_t.pow(2)
+            # Update filter state for the next sample.
+            filter.step(x[t], d_obs[t])
+            # Truncated BPTT: detach R, p, AND w
+            # (decision 4; the e_prior path threads the old graph through w).
+            if (t + 1) % truncate_every == 0:
+                filter.w = filter.w.detach()
+                filter.R = filter.R.detach()
+                filter.p = filter.p.detach()
+        # ``loss_preq`` keeps its grad_fn through the last ``truncate_every``
+        # steps only (the most recent chunk).  Earlier chunks are detached
+        # at the next ``filter.w.detach()`` boundary because the next
+        # ``e_t`` then loses its grad_fn.  The implicit gradient (now
+        # ``phantom`` mode in ``FabricRobustRLS.step``) is cheap enough
+        # that the chain through the last chunk is tractable.
+
+        loss_term = 10.0 * (filter.w - w_o).pow(2).sum()
+        loss = loss_preq + loss_term
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            c_here = weighter.c.item()
+            alpha_here = weighter.alpha.item()
+        rec = {
+            'epoch': epoch,
+            'loss': float(loss.item()),
+            'loss_preq': float(loss_preq.item()),
+            'loss_term': float(loss_term.item()),
+            'c': float(c_here),
+            'alpha': float(alpha_here),
+        }
+        history.append(rec)
+        if log_every and (epoch % log_every == 0 or epoch == epochs - 1):
+            print(f"  [train_robust] epoch {epoch:4d}"
+                  f"  loss={rec['loss']:.4e}"
+                  f"  preq={rec['loss_preq']:.4e}"
+                  f"  term={rec['loss_term']:.4e}"
+                  f"  c={c_here:.4f}  alpha={alpha_here:.4f}",
+                  flush=True)
+
+    if save_path is not None:
+        torch.save(weighter.state_dict(), save_path)
+        print(f"  [train_robust] saved weighter to {save_path}")
+
+    weighter.eval()
+    if return_history:
+        return weighter, history
+    return weighter
+
+
+def _psi_curve(weighter, e_grid):
+    """Return (v, psi) over an e-grid; psi(e) = v(e) * e (the influence
+    *  prior error, the per-sample pseudo-residual weighting)."""
+    with torch.no_grad():
+        v = weighter(e_grid)
+        psi = v * e_grid
+    return v.detach().cpu().numpy(), psi.detach().cpu().numpy()
+
+
+def plot_robust_learning_curves(out_dir, results, w_o, suptitle):
+    """4 contenders under impulsive noise: ensemble-mean ||w_t - w_o||^2."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    T = next(iter(results.values()))[0].shape[0]
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    colors = {'digital_rls': 'C1',
+              'fabric_rls': 'C3',
+              'digital_robust_rls': 'C4',
+              'fabric_robust_rls': 'C5'}
+    styles = {'digital_rls': '-',
+              'fabric_rls': '--',
+              'digital_robust_rls': '-',
+              'fabric_robust_rls': '--'}
+    for name, (W_mean, _) in results.items():
+        err = w_err_sq(W_mean, w_o).cpu().numpy()
+        ax.semilogy(np.arange(T), err,
+                    label=name, color=colors.get(name, 'k'),
+                    linestyle=styles.get(name, '-'), linewidth=1.5)
+    ax.set_xlabel('sample t')
+    ax.set_ylabel(r'$\|w_t - w_o\|^2$')
+    ax.set_title(suptitle)
+    ax.legend()
+    ax.grid(True, which='both', alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, 'robust_learning_curves.png'), dpi=140)
+    plt.close(fig)
+
+
+def plot_robust_discrepancy(out_dir, W_fabric_robust, W_digital_robust):
+    """||w_fabric_robust - w_digital_robust|| / ||w_digital_robust|| vs t."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    T = W_fabric_robust.shape[0]
+    disc = relative_discrepancy(W_fabric_robust, W_digital_robust).cpu().numpy()
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.semilogy(np.arange(T), disc, color='C5', linewidth=1.5)
+    ax.set_xlabel('sample t')
+    ax.set_ylabel(r'$\|w_{\mathrm{fabric\,robust}} - w_{\mathrm{digital\,robust}}\|/\|\cdot\|$')
+    ax.set_title('Fabric-robust vs Digital-robust discrepancy')
+    ax.grid(True, which='both', alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, 'robust_discrepancy.png'), dpi=140)
+    plt.close(fig)
+
+
+def plot_robust_influence(out_dir, e_grid_np, v_init, psi_init, v_trained, psi_trained):
+    """Two-panel plot: v(e) and psi(e) = v(e) * e (the influence*error
+    pseudo-residual) overlay of init vs trained weighter."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+    axes[0].plot(e_grid_np, v_init, '--', color='C0', label='init v(e)')
+    axes[0].plot(e_grid_np, v_trained, '-', color='C3', label='trained v(e)')
+    axes[0].set_xlabel('e_prior')
+    axes[0].set_ylabel(r'$v(e)$')
+    axes[0].set_title('Influence v(e)')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(e_grid_np, psi_init, '--', color='C0', label=r'init $\psi(e) = v(e) \cdot e$')
+    axes[1].plot(e_grid_np, psi_trained, '-', color='C3', label=r'trained $\psi(e)$')
+    axes[1].set_xlabel('e_prior')
+    axes[1].set_ylabel(r'$\psi(e) = v(e) \cdot e$')
+    axes[1].set_title('Influence-weighted error')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    fig.suptitle('Learned robust weighter (init vs trained)')
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, 'robust_influence.png'), dpi=140)
+    plt.close(fig)
+
+
+def run_robust_experiment(args, out_dir, w_o, device, dtype, seed):
+    """Phase 1 robust experiment: 4 contenders under impulsive noise
+    with a frozen (or freshly trained) weighter.
+
+    Plots:
+      * robust_learning_curves.png  -- 4 contenders
+      * robust_discrepancy.png      -- fabric-robust vs digital-robust
+      * settling_budget.png         -- fabric-robust settle-iter histogram
+      * robust_influence.png        -- v(e) and psi(e), init vs trained
+    """
+    # Lazy import (plan decision 9).
+    from utils.learned_robust import (
+        FabricRobustRLS, DigitalRobustRLS,
+        LearnedRobustWeighter, constant_weighter,
+    )
+
+    # ---- Train or load weighter ----
+    weighter_train = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    if args.robust_weighter_path and os.path.exists(args.robust_weighter_path):
+        sd = torch.load(args.robust_weighter_path, map_location='cpu')
+        weighter_train.load_state_dict(sd)
+        print(f"  [robust] loaded trained weighter from {args.robust_weighter_path}")
+    else:
+        print(f"  [robust] training weighter: epochs={args.robust_epochs},"
+              f" T={args.robust_T}, sigma={args.sigma}, p_burst={args.p_burst},"
+              f" kappa={args.kappa}, lr={args.robust_lr}, truncate={args.truncate}")
+        weighter_train, history = train_robust_weighter(
+            d=args.d, epochs=args.robust_epochs, T=args.robust_T,
+            lam=args.lam_rls, sigma=args.sigma, p_burst=args.p_burst,
+            kappa=args.kappa, device=device, lr=args.robust_lr,
+            truncate_every=args.truncate,
+            linear_max_iter=args.linear_max_iter, linear_tol=args.linear_tol,
+            seed=seed, log_every=max(1, args.robust_epochs // 8),
+            return_history=True)
+        with open(os.path.join(out_dir, 'robust_training_history.json'), 'w') as f:
+            json.dump(history, f, indent=2)
+        # Save the trained weighter for reuse.
+        save_path = os.path.join(out_dir, 'robust_weighter.pt')
+        torch.save(weighter_train.state_dict(), save_path)
+        print(f"  [robust] saved trained weighter to {save_path}")
+
+    # Cast frozen weighter to eval dtype (decision 10: train float32, eval float64).
+    weighter = weighter_train.to(device).to(dtype)
+    weighter.eval()
+    const_w = constant_weighter(1.0).to(device).to(dtype)
+
+    # ---- 4 contenders ----
+    def digital_rls_factory():
+        return DigitalRLS(d=args.d, lam=args.lam_rls, device=device)
+
+    def fabric_rls_factory(log_name=''):
+        return FabricRLS(d=args.d, lam=args.lam_rls,
+                         R0=torch.eye(args.d, device=device, dtype=dtype),
+                         max_iter=args.linear_max_iter, tol=args.linear_tol,
+                         beta=args.linear_beta, device=device,
+                         log_every=0, log_name=log_name)
+
+    def digital_robust_factory():
+        # v==1 (constant weighter) -> byte-identical to DigitalRLS.
+        return DigitalRobustRLS(d=args.d, weighter=const_w, lam=args.lam_rls,
+                                device=device, training=False)
+
+    def fabric_robust_factory(log_name=''):
+        return FabricRobustRLS(d=args.d, weighter=weighter, lam=args.lam_rls,
+                                R0=torch.eye(args.d, device=device, dtype=dtype),
+                                max_iter=args.linear_max_iter, tol=args.linear_tol,
+                                beta=args.linear_beta, device=device,
+                                training=False, log_every=0,
+                                log_name=log_name)
+
+    contenders = {
+        'digital_rls': digital_rls_factory,
+        'fabric_rls': fabric_rls_factory,
+        'digital_robust_rls': digital_robust_factory,
+        'fabric_robust_rls': fabric_robust_factory,
+    }
+
+    print(f"\n=== Robust experiment: iid input, noise={args.noise}, "
+          f"T={args.T}, sigma={args.sigma}, n_trials={args.n_trials} ===",
+          flush=True)
+    results = {}
+    extras_all = {}
+    for name, factory in contenders.items():
+        def factory_wrapped(f=factory, n=name):
+            try:
+                return f(log_name=n)
+            except TypeError:
+                return f()
+        t0 = time.time()
+        W_mean, _, extras = monte_carlo(factory_wrapped,
+                                       w_o, args.T, args.sigma,
+                                       args.n_trials, mode='iid',
+                                       noise=args.noise, p_burst=args.p_burst,
+                                       kappa=args.kappa,
+                                       seed_base=seed, dtype=dtype, device=device,
+                                       name=f'robust/{name}',
+                                       log_every=max(1, args.n_trials // 5))
+        print(f"  [{name}] total: {time.time() - t0:.2f}s", flush=True)
+        results[name] = (W_mean, None)
+        extras_all[name] = extras
+
+    plot_robust_learning_curves(out_dir, results, w_o,
+                                rf'Robust: ensemble-mean $\|w-w_o\|^2$ '
+                                f'({args.n_trials} trials, noise={args.noise})')
+    plot_robust_discrepancy(out_dir, results['fabric_robust_rls'][0],
+                            results['digital_robust_rls'][0])
+
+    iters = []
+    for extras in extras_all['fabric_robust_rls']:
+        iters.extend(extras.get('last_iters', []))
+    if iters:
+        plot_settling_budget(out_dir, iters,
+                             label='Fabric-robust LinearSolveLayer iterations per sample')
+        print(f"  [fabric_robust] settling budget: mean={np.mean(iters):.2f}, "
+              f"max={max(iters)}, median={np.median(iters):.0f}, n={len(iters)}",
+              flush=True)
+
+    # ---- Influence curve: init vs trained overlay ----
+    e_grid = torch.linspace(-0.5, 0.5, 401, device=device, dtype=dtype)
+    init_w = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0).to(device).to(dtype)
+    init_w.eval()
+    v_init, psi_init = _psi_curve(init_w, e_grid)
+    v_trained, psi_trained = _psi_curve(weighter, e_grid)
+    plot_robust_influence(out_dir, e_grid.cpu().numpy(),
+                          v_init, psi_init, v_trained, psi_trained)
+
+    # ---- Save metrics ----
+    metrics = {
+        'd': args.d,
+        'T': args.T,
+        'sigma': args.sigma,
+        'noise': args.noise,
+        'p_burst': args.p_burst,
+        'kappa': args.kappa,
+        'n_trials': args.n_trials,
+        'device': str(device),
+        'training': {
+            'epochs': args.robust_epochs,
+            'T': args.robust_T,
+            'truncate_every': args.truncate,
+            'lr': args.robust_lr,
+        },
+        'weighter': {
+            'c': float(weighter.c.item()),
+            'alpha': float(weighter.alpha.item()),
+        },
+        'settling': {'mean': float(np.mean(iters)) if iters else None,
+                     'max': int(max(iters)) if iters else None,
+                     'median': float(np.median(iters)) if iters else None,
+                     'n': len(iters)},
+    }
+    with open(os.path.join(out_dir, 'robust_metrics.json'), 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"\n  [robust] Wrote metrics to {out_dir}/robust_metrics.json")
+    print(f"  [robust] trained weighter: c={metrics['weighter']['c']:.4f}, "
+          f"alpha={metrics['weighter']['alpha']:.4f}")
+    print(f"  Figures in {out_dir}/")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Streaming RLS adaptive-filtering demo')
     parser.add_argument('--out_dir', type=str, default='./results/rls_demo')
@@ -900,6 +1319,37 @@ def parse_args():
                              "the solved problem becomes argmin weight*||Xw-d||^2 "
                              "+ w^T R0 w (a uniform-weight least-squares variant, "
                              "not a forgetting factor).")
+    # ---- Phase 1: noise plumbing ----
+    parser.add_argument('--noise', type=str, default='gaussian',
+                        choices=['gaussian', 'impulsive'],
+                        help="Noise model for make_stream (plan decision 6). "
+                             "'gaussian' is the legacy default; 'impulsive' is "
+                             "the contaminated-Gaussian mixture used to train "
+                             "and evaluate the robust weighter.")
+    parser.add_argument('--p_burst', type=float, default=0.02,
+                        help="Burst probability for impulsive noise (default 0.02).")
+    parser.add_argument('--kappa', type=float, default=20.0,
+                        help="Burst magnitude multiplier for impulsive noise "
+                             "(default 20.0; burst draws ~ kappa * sigma * randn).")
+    # ---- Phase 1: robust weighter training / eval ----
+    parser.add_argument('--train_robust', action='store_true',
+                        help="Run the Phase 1 robust experiment (train weighter "
+                             "if --robust_weighter_path is not supplied, then "
+                             "evaluate 4 contenders under --noise).")
+    parser.add_argument('--robust_epochs', type=int, default=80,
+                        help="Number of epochs to train the robust weighter "
+                             "(plan decision 7; default 80).")
+    parser.add_argument('--robust_T', type=int, default=128,
+                        help="Stream length per training epoch (default 128).")
+    parser.add_argument('--truncate', type=int, default=32,
+                        help="Truncated BPTT window: detach R, p, AND w every "
+                             "this many samples (plan decision 4; default 32).")
+    parser.add_argument('--robust_lr', type=float, default=1e-2,
+                        help="Adam learning rate for the robust weighter (default 1e-2).")
+    parser.add_argument('--robust_weighter_path', type=str, default=None,
+                        help="Optional path to a trained weighter state-dict. "
+                             "If supplied and the file exists, skip training and "
+                             "use the loaded weighter for evaluation.")
     return parser.parse_args()
 
 

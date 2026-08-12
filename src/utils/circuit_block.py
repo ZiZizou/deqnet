@@ -794,10 +794,15 @@ class LinearSolveLayer(nn.Module):
     required — just one more equilibrium of the same operator).
     """
 
-    def __init__(self, max_iter=50, tol=1e-6, beta=1.0):
+    def __init__(self, max_iter=50, tol=1e-6, beta=1.0, backward_mode='exact',
+                 backward_tol=None, backward_max_iter=None):
         super().__init__()
+        bt_tol = backward_tol if backward_tol is not None else tol
+        bt_max = backward_max_iter if backward_max_iter is not None else max_iter
         self.solver_cfg = {'method': 'anderson', 'max_iter': max_iter, 'tol': tol,
-                            'backward_mode': 'exact', 'beta': beta}
+                            'backward_mode': backward_mode,
+                            'backward_tol': bt_tol, 'backward_max_iter': bt_max,
+                            'beta': beta}
 
     def _matvec_R(self, w, R):
         if R.dim() == 3:
@@ -808,8 +813,23 @@ class LinearSolveLayer(nn.Module):
     def rhs(self, w, p, R):
         return p - self._matvec_R(w, R)
 
-    def forward(self, p, R):
-        init = torch.zeros_like(p)
+    def forward(self, p, R, init=None):
+        """Solve w* = R^{-1} p via the linear equilibrium.
+
+        Parameters
+        ----------
+        p : (B, d) tensor
+            Per-batch RHS vector.
+        R : (d, d) or (B, d, d) tensor
+            SPD linear operator.  Batched only when R is 3-D.
+        init : (B, d) tensor, optional
+            Warm-starting initial guess for the fixed-point iteration.  Default
+            `None` falls back to zeros (legacy / cold-start behaviour).  The
+            init is gradient-safe: it doesn't carry an autograd graph, so the
+            implicit backward is unaffected by the choice of init.
+        """
+        if init is None:
+            init = torch.zeros_like(p)
         last_v_star = None
 
         def rhs_fn(w, _p=p, _R=R):

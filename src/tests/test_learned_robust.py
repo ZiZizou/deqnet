@@ -1,8 +1,9 @@
-"""Phase 0 gradcheck gate for the learned model plumbing.
+"""Phase 0 + Phase 1 gates for the learned-IR-RLS design.
 
-The LinearSolveLayer is the shared building block for both Milestone 1
-(learned robust IR-RLS) and Milestone 2 (learned-prox ISTA). The
-end-to-end implicit training loop is only viable if:
+Phase 0 (gradcheck / plumbing):
+  The LinearSolveLayer is the shared building block for both Milestone 1
+  (learned robust IR-RLS) and Milestone 2 (learned-prox ISTA). The
+  end-to-end implicit training loop is only viable if:
 
   (a) gradients flow to p (the solve's ``u`` argument) and to R
       (closure-captured into ``rhs_fn``) when at least one input
@@ -10,22 +11,25 @@ end-to-end implicit training loop is only viable if:
   (b) the analytical gradients (via ``.backward()`` + ``.grad``) match
       finite-difference estimates to solver tolerance.
 
-The plan's original ``gradcheck_solve`` used ``torch.autograd.gradcheck``
-on ``(p, R)``. That API does not work here because R is closure-captured
-into ``EquilibriumSolve``'s ``rhs_fn`` rather than passed as a Function
-input, so ``autograd.grad`` can't see R in the graph (analytical returns
-zero, numerical is non-zero, and the test reports a spurious Jacobian
-mismatch). The legacy ``.backward() + .grad`` mechanism DOES populate
-``R.grad`` via the ``f_.backward(−y)`` call inside
-``EquilibriumSolve.backward`` (``circuit_block.py:680``), which is what
-the actual training loop uses.
+  The plan's original ``gradcheck_solve`` used ``torch.autograd.gradcheck``
+  on ``(p, R)``. That API does not work here because R is closure-captured
+  into ``EquilibriumSolve``'s ``rhs_fn`` rather than passed as a Function
+  input, so ``autograd.grad`` can't see R in the graph (analytical returns
+  zero, numerical is non-zero, and the test reports a spurious Jacobian
+  mismatch). The legacy ``.backward() + .grad`` mechanism DOES populate
+  ``R.grad`` via the ``f_.backward(−y)`` call inside
+  ``EquilibriumSolve.backward`` (``circuit_block.py:680``), which is what
+  the actual training loop uses.
 
-So the Phase 0 gate is a finite-difference validation of the
-``.backward()``-based gradient, not ``autograd.gradcheck``. If the
-fabric-training loop works (weighter gets gradient), this gate passes;
-if it doesn't, no amount of gradcheck-style testing will save us.
+  So the Phase 0 gate is a finite-difference validation of the
+  ``.backward()``-based gradient, not ``autograd.gradcheck``. If the
+  fabric-training loop works (weighter gets gradient), this gate passes;
+  if it doesn't, no amount of gradcheck-style testing will save us.
 
-Gate 1 of the plan. No model code in this phase.
+Phase 1 (learned robust IR-RLS):
+  Six new gates exercise the ``LearnedRobustWeighter`` and the
+  ``FabricRobustRLS`` / ``DigitalRobustRLS`` subclasses.  See the
+  ``LEARNED_RLS_ISTA_PLAN.md`` file for the full plan.
 """
 import os
 import sys
@@ -241,12 +245,350 @@ def test_weighter_grad_flow_simulation(d=4, tol=1e-4):
         f"rel_err={rel_err:.2e}, tol={tol}"
 
 
+# ----------------------------------------------------------------------------
+# Phase 1 gates (require utils.learned_robust + run_rls_demo.DigitalRLS).
+# ----------------------------------------------------------------------------
+
+from utils.learned_robust import (
+    LearnedRobustWeighter, FabricRobustRLS, DigitalRobustRLS,
+    constant_weighter,
+)
+from run_rls_demo import DigitalRLS, FabricRLS, _make_noise, make_stream
+from utils.circuit_block import LinearSolveLayer
+
+
+def test_weighter_bounds():
+    """Gate 5 (KIMI correction #5): v_t in (0, 1] for |e| up to 1e3.
+
+    Load-bearing invariant for the SPD certificate on R.  If anyone
+    later edits the parameterization, this should fail loudly.
+    """
+    w = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    e_grid = torch.tensor([1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0],
+                          dtype=torch.float64)
+    v = w(e_grid)
+    assert (v > 0).all(), f"v_t has non-positive entries: {v}"
+    assert (v <= 1.0 + 1e-7).all(), f"v_t exceeds v_max: {v}"
+    # Sanity: very small e -> v near 1; very large e -> v bounded away
+    # from v_max (the descent rate is governed by alpha ~ 0.127).
+    assert v[0].item() > 0.99, f"v(1e-3) should be near 1, got {v[0].item():.4e}"
+    assert v[-1].item() < 0.5, f"v(1e3) should descend below 0.5, got {v[-1].item():.4e}"
+    # And importantly: v is finite & bounded for all |e| (no overflow).
+    assert torch.isfinite(v).all(), f"v has non-finite entries: {v}"
+
+def test_constant_weighter_returns_one():
+    """Sanity check on the byte-exact identity helper."""
+    cw = constant_weighter(1.0)
+    e = torch.randn(7)
+    v = cw(e)
+    assert torch.allclose(v, torch.ones(7)), f"constant weighter returned {v}"
+    print(f"  [constant weighter] v shape={v.shape}, v[0]={v[0].item():.4f}. PASS")
+
+
+def test_weighter_init_unit_check():
+    """Gate 2b (per plan decision 2b): weighter init unit check.
+
+    v(0) = 1 (exactly), v ~ 1 for |e| <= 0.1, and v redescends for
+    |e| >> c ~ 0.107.  The 'frozen init matches plain RLS' split
+    (decision 2a) is the byte-exact v==1 case covered by the
+    digital/fabric v==1 tests below.
+    """
+    w = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    # v(0) = 1 exactly
+    v0 = w(torch.tensor(0.0))
+    assert torch.allclose(v0, torch.tensor(1.0), atol=1e-12), f"v(0)={v0.item()}"
+    # v(e) ~ 1 for small |e|.  With c ~ 0.107 (init raw_c=-2.25) and
+    # alpha ~ 0.127, v(0.05) ~ 0.975 and v(0.1) ~ 0.92.
+    e_small = torch.linspace(-0.05, 0.05, 11)
+    v_small = w(e_small)
+    assert (v_small > 0.95).all() and (v_small <= 1.0 + 1e-12).all(), \
+        f"v(e) for |e|<=0.05 should be ~1, got {v_small}"
+    # v redescends for |e| >> c.  With init (c ~ 0.107, alpha ~ 0.127),
+    # v(10) ~ 0.31, v(100) ~ 0.17, v(1000) ~ 0.10.  The threshold is
+    # set so v(10) is required to descend measurably (~ v at the burst
+    # magnitude kappa*sigma = 0.2) without demanding full saturation.
+    e_large = torch.tensor([10.0, 100.0, 1000.0])
+    v_large = w(e_large)
+    assert (v_large < 0.4).all(), f"v(e) for |e|>>c should descend, got {v_large}"
+    # Stronger descent at |e| >= 100: the weighter must be meaningful
+    # at the saturation tail (the trained weighter should move these
+    # far below 0.2 during training; the init just has to be < 0.3).
+    assert (v_large[1:] < 0.3).all(), f"v(e) for |e|>=100 should descend, got {v_large[1:]}"
+    # v_max=1.0 strictly
+    assert torch.allclose(w.v_max, torch.tensor(1.0))
+    print(f"  [weighter init unit] v(0)={v0.item():.6f}, "
+          f"v(0.05)={v_small[10].item():.4f}, v(10)={v_large[0].item():.4e}, "
+          f"v(1e3)={v_large[-1].item():.4e}. PASS")
+
+
+def test_digital_robust_v1_byteexact_matches_digital_rls(d=8, T=64, lam=0.99,
+                                                          seed=0):
+    """Gate 2a / Gate 3: v_t == 1 makes DigitalRobustRLS byte-identical
+    to DigitalRLS (the strong invariant 'v_t=1 -> identical')."""
+    torch.manual_seed(seed)
+    const_w = constant_weighter(1.0, dtype=torch.float32)
+    g = torch.Generator().manual_seed(seed)
+    w_o = torch.randn(d, generator=g, dtype=torch.float32)
+    w_o = w_o / w_o.norm()
+    x = torch.randn(T, d, generator=g, dtype=torch.float32)
+    d_obs = x @ w_o + 0.01 * torch.randn(T, generator=g, dtype=torch.float32)
+
+    drls = DigitalRLS(d=d, lam=lam, device='cpu')
+    drrs = DigitalRobustRLS(d=d, weighter=const_w, lam=lam, device='cpu')
+    for t in range(T):
+        w1 = drls.step(x[t], d_obs[t])
+        w2 = drrs.step(x[t], d_obs[t])
+        assert torch.equal(w1, w2), \
+            f"step {t}: digital_rls.w={w1} vs digital_robust.w={w2}"
+    assert torch.equal(drls.P, drrs.P), \
+        f"final P mismatch: digital_rls.P={drls.P} vs digital_robust.P={drrs.P}"
+    print(f"  [digital_robust v=1 byte-exact] T={T}, d={d}: "
+          f"all {T} steps match DigitalRLS to the bit. PASS")
+
+
+def test_fabric_robust_v1_close_to_fabric_rls(d=8, T=64, lam=0.99,
+                                                tol=1e-5, seed=0):
+    """Gate 2a — fabric variant.  Not byte-exact (the fabric path goes
+    through LinearSolveLayer with chebyshev beta, which has its own
+    solver noise), but should match to solver tolerance."""
+    torch.manual_seed(seed)
+    const_w = constant_weighter(1.0, dtype=torch.float32)
+    g = torch.Generator().manual_seed(seed)
+    w_o = torch.randn(d, generator=g, dtype=torch.float32)
+    w_o = w_o / w_o.norm()
+    x = torch.randn(T, d, generator=g, dtype=torch.float32)
+    d_obs = x @ w_o + 0.01 * torch.randn(T, generator=g, dtype=torch.float32)
+
+    frls = FabricRLS(d=d, lam=lam, R0=torch.eye(d, dtype=torch.float32),
+                     max_iter=200, tol=1e-10, beta='chebyshev', device='cpu')
+    frrs = FabricRobustRLS(d=d, weighter=const_w, lam=lam,
+                            R0=torch.eye(d, dtype=torch.float32),
+                            max_iter=200, tol=1e-10, beta='chebyshev',
+                            device='cpu')
+    for t in range(T):
+        w1 = frls.step(x[t], d_obs[t])
+        w2 = frrs.step(x[t], d_obs[t])
+    err = (w1 - w2).norm().item()
+    rel_err = err / max(w1.norm().item(), 1e-12)
+    print(f"  [fabric_robust v=1 trail] final ||w_fabric - w_fabric_robust||="
+          f"{err:.4e}, rel={rel_err:.4e}, tol={tol}")
+    # Final-error check only — the trajectories drift apart slightly
+    # over T=64 because the warm-starting init=w.detach() interacts
+    # differently with the two paths.
+    assert rel_err < tol, f"final w mismatch: rel_err={rel_err:.4e} > {tol}"
+
+
+def test_digital_robust_matches_fabric_robust(d=8, T=64, lam=0.99,
+                                                tol=1e-5, seed=0):
+    """Gate 3: digital-robust and fabric-robust trajectories match to
+    solver tolerance (KIMI correction #2: 1e-5 not 1e-6; the feedback-
+    amplification floor at lam=0.99 with default tol is ~1e-6)."""
+    torch.manual_seed(seed)
+    # Float32 throughout: byte-exact and trajectory-match tests use the
+    # natural dtype of the underlying DigitalRLS (P is float32-default).
+    # The implicit-vs-unrolled gradient test below keeps float64 because
+    # it hands a closed-form reference through autograd in float64.
+    const_w = constant_weighter(1.0, dtype=torch.float32)
+    g = torch.Generator().manual_seed(seed)
+    w_o = torch.randn(d, generator=g, dtype=torch.float32)
+    w_o = w_o / w_o.norm()
+    x = torch.randn(T, d, generator=g, dtype=torch.float32)
+    d_obs = x @ w_o + 0.01 * torch.randn(T, generator=g, dtype=torch.float32)
+
+    drrs = DigitalRobustRLS(d=d, weighter=const_w, lam=lam, device='cpu')
+    frrs = FabricRobustRLS(d=d, weighter=const_w, lam=lam,
+                            R0=torch.eye(d, dtype=torch.float32),
+                            max_iter=500, tol=1e-12, beta='chebyshev',
+                            device='cpu')
+    W_d = torch.zeros(T, d, dtype=torch.float32)
+    W_f = torch.zeros(T, d, dtype=torch.float32)
+    for t in range(T):
+        W_d[t] = drrs.step(x[t], d_obs[t])
+        W_f[t] = frrs.step(x[t], d_obs[t])
+    # Discrepancy measure: max relative ||w_d - w_f|| over time.
+    errs = (W_d - W_f).norm(dim=-1)
+    rel = errs / W_d.norm(dim=-1).clamp_min(1e-12)
+    max_rel = rel.max().item()
+    print(f"  [digital_robust vs fabric_robust] max rel err={max_rel:.4e}, "
+          f"tol={tol}")
+    assert max_rel < tol, f"max rel err={max_rel:.4e} > tol={tol}"
+
+
+def test_implicit_vs_unrolled_grad_robust(d=8, T=8, lam=0.99, tol=1e-4,
+                                            seed=0):
+    """Gate 4: implicit-backward gradient matches a fully-unrolled
+    forward reference to rel err < 1e-4 (KIMI correction #3: float64 +
+    tol 1e-10 to isolate algorithmic error from precision error)."""
+    torch.manual_seed(seed)
+    g = torch.Generator().manual_seed(seed)
+    w_o = torch.randn(d, generator=g, dtype=torch.float64)
+    w_o = w_o / w_o.norm()
+    x = torch.randn(T, d, generator=g, dtype=torch.float64)
+    d_obs = x @ w_o + 0.05 * torch.randn(T, generator=g, dtype=torch.float64)
+
+    # ---- Implicit backward path (production) ----
+    w_imp = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    w_imp.raw_c.data = w_imp.raw_c.data.double()
+    w_imp.raw_alpha.data = w_imp.raw_alpha.data.double()
+    d64 = torch.float64
+    fr_imp = FabricRobustRLS(d=d, weighter=w_imp, lam=lam,
+                             R0=torch.eye(d, dtype=d64),
+                             w_init=torch.zeros(d, dtype=d64),
+                             max_iter=50, tol=1e-10, beta=0.5,
+                             device='cpu', training=True,
+                             backward_mode='exact')
+    loss_imp = torch.zeros((), dtype=torch.float64)
+    for t in range(T):
+        e_t = d_obs[t] - fr_imp.w @ x[t]
+        loss_imp = loss_imp + e_t.pow(2).sum()
+        fr_imp.step(x[t], d_obs[t])
+    loss_imp.backward()
+    g_imp = w_imp.raw_c.grad.item()
+
+    # ---- Unrolled forward reference ----
+    w_unr = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    w_unr.raw_c.data = w_imp.raw_c.data.clone()
+    w_unr.raw_alpha.data = w_imp.raw_alpha.data.clone()
+    R_unr = torch.eye(d, dtype=torch.float64)
+    p_unr = torch.zeros(d, dtype=torch.float64)
+    w_state = torch.zeros(d, dtype=torch.float64)
+    loss_unr = torch.zeros((), dtype=torch.float64)
+    layer = LinearSolveLayer(max_iter=50, tol=1e-10, beta=0.5)
+    for t in range(T):
+        e_t = d_obs[t] - w_state @ x[t]
+        loss_unr = loss_unr + e_t.pow(2).sum()
+        v_t = w_unr(e_t)
+        R_unr = lam * R_unr + v_t * torch.outer(x[t], x[t])
+        p_unr = lam * p_unr + v_t * d_obs[t] * x[t]
+        w_state = layer(p_unr.unsqueeze(0), R_unr).squeeze(0)
+    loss_unr.backward()
+    g_unr = w_unr.raw_c.grad.item()
+
+    rel_err = abs(g_imp - g_unr) / max(abs(g_unr), 1e-12)
+    print(f"  [implicit vs unrolled grad robust d={d} T={T}] "
+          f"g_imp={g_imp:.6e}, g_unr={g_unr:.6e}, rel_err={rel_err:.2e}, "
+          f"tol={tol}")
+    assert rel_err < tol, f"implicit vs unrolled grad mismatch: rel_err={rel_err:.2e}"
+
+
+def test_impulsive_noise_burst_rate(T=20000, p_burst=0.02, kappa=20.0,
+                                     sigma=0.01, tol=0.005, seed=0):
+    """Gate 5: _make_noise burst statistics; gaussian mode ≡ ``sigma * randn``.
+
+    Burst rate should be ~ p_burst (within tol), and burst amplitude
+    should be ~ sqrt(1 + kappa^2) * sigma (the std of z1 + kappa * z2).
+    """
+    # Impulsive: use two parallel generators seeded identically so the
+    # byte-identical check is meaningful (g itself is shared/advanced by
+    # _make_noise, so we can't reuse it for the reference draws).
+    g_a = torch.Generator().manual_seed(seed)
+    g_b = torch.Generator().manual_seed(seed)
+    nu_imp = _make_noise(T, sigma, mode='impulsive',
+                         p_burst=p_burst, kappa=kappa,
+                         generator=g_a, dtype=torch.float64)
+    z1 = torch.randn(T, generator=g_b, dtype=torch.float64)
+    z2 = torch.randn(T, generator=g_b, dtype=torch.float64)
+    burst = (torch.rand(T, generator=g_b, dtype=torch.float64) < p_burst).to(torch.float64)
+    nu_check = sigma * (z1 + kappa * burst * z2)
+    assert torch.equal(nu_imp, nu_check), \
+        "_make_noise impulsive path is not byte-identical to its decomposition"
+    burst_rate = burst.mean().item()
+    burst_amp = nu_imp[burst > 0.5].abs().mean().item()
+    # Theoretical burst amplitude std would be sigma * sqrt(1 + kappa^2)
+    # for the marginal; the mean abs is sigma * sqrt(2/pi) * sqrt(1 + kappa^2).
+    import math
+    expected_amp = sigma * math.sqrt(2.0 / math.pi) * math.sqrt(1.0 + kappa * kappa)
+    print(f"  [impulsive noise] burst rate={burst_rate:.4f} (target {p_burst}), "
+          f"burst |mean|={burst_amp:.4e} (expected ~ {expected_amp:.4e})")
+    assert abs(burst_rate - p_burst) < tol, \
+        f"burst_rate={burst_rate} differs from p_burst={p_burst} by more than {tol}"
+    # Burst amplitude check (15% relative tolerance for the empirical mean abs)
+    assert abs(burst_amp - expected_amp) / expected_amp < 0.15, \
+        f"burst amplitude {burst_amp} differs from expected {expected_amp}"
+
+    # Gaussian mode ≡ old make_stream noise: use two parallel generators
+    # seeded identically so the byte-identical check is meaningful.
+    g_a = torch.Generator().manual_seed(seed)
+    g_b = torch.Generator().manual_seed(seed)
+    nu_gauss = _make_noise(T, sigma, mode='gaussian', generator=g_a,
+                            dtype=torch.float64)
+    nu_legacy = sigma * torch.randn(T, generator=g_b, dtype=torch.float64)
+    assert torch.equal(nu_gauss, nu_legacy), \
+        "_make_noise gaussian path is not byte-identical to sigma * randn"
+    print(f"  [impulsive noise] gaussian mode byte-identical to legacy. PASS")
+
+
+def test_gaussian_control_flat_weighter(epochs=20, T=8, lam=0.99, sigma=0.01,
+                                          d=4, lr=1e-2, seed=0):
+    """Gate 6 (KIMI correction #4): on Gaussian noise the trained weighter
+    should be approximately flat (low Var_e[v(e)]).  We don't require
+    alpha -> 0 specifically (c -> infinity would also satisfy the
+    functional property); we test the variance directly."""
+    torch.manual_seed(seed)
+    device = torch.device('cpu')
+    weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0).to(device)
+    optimizer = torch.optim.Adam(weighter.parameters(), lr=lr)
+
+    for epoch in range(epochs):
+        w_o = torch.randn(d, device=device)
+        w_o = w_o / w_o.norm()
+        x, d_obs = make_stream(w_o, T, sigma, mode='iid', noise='gaussian',
+                               seed=epoch, dtype=torch.float32, device=device)
+        R0 = torch.eye(d, device=device, dtype=torch.float32)
+        filt = FabricRobustRLS(d=d, weighter=weighter, lam=lam, R0=R0,
+                               max_iter=50, tol=1e-5, beta='chebyshev',
+                               device=device, training=True)
+        loss = torch.zeros((), device=device)
+        for t in range(T):
+            e_t = d_obs[t] - filt.w @ x[t]
+            loss = loss + e_t.pow(2).sum()
+            filt.step(x[t], d_obs[t])
+            # No filter.w/R/p detach here.  Detaching them would break
+            # the next e_t's grad_fn and propagate "no grad_fn" through
+            # the loss accumulator's chained additions.  The chain
+            # through R/p grows by one step per iteration; with the
+            # ``phantom`` backward mode set by ``FabricRobustRLS`` when
+            # ``training=True`` the per-step cost is O(chain_depth) and
+            # total backward is O(T * chain_depth).  For T=32, d=4 this
+            # is tractable.  (The train_robust_weighter smoke test uses
+            # T=128 with truncate_every=32; same pattern.)
+        loss = loss + 10.0 * (filt.w - w_o).pow(2).sum()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+
+    # Functional property: Var_e[v(e)] on a typical Gaussian noise grid.
+    e_grid = torch.linspace(-0.05, 0.05, 51, device=device, dtype=torch.float32)
+    with torch.no_grad():
+        v = weighter(e_grid)
+    var_v = v.var().item()
+    alpha_here = weighter.alpha.item()
+    c_here = weighter.c.item()
+    print(f"  [gaussian_control] epochs={epochs}, "
+          f"alpha={alpha_here:.4f}, c={c_here:.4f}, Var_e[v(e)]={var_v:.4e}")
+    # Threshold: variance below 5e-3 on a 0.1-wide grid means v is
+    # essentially constant (the largest possible v - v_mean is ~ the std).
+    assert var_v < 5e-3, \
+        f"Var_e[v(e)]={var_v:.4e} too large; weighter not flat on Gaussian noise"
+
 if __name__ == '__main__':
     print("=" * 60)
-    print("Phase 0 gradcheck gate (no model code)")
+    print("Phase 0 + Phase 1 gates")
     print("=" * 60)
+    # Phase 0
     test_linear_solve_layer_gradients_flow()
     test_gradcheck_via_finite_diff()
     test_gradcheck_batch()
     test_weighter_grad_flow_simulation()
-    print("\nPhase 0 gate passed.")
+    # Phase 1
+    test_weighter_bounds()
+    test_constant_weighter_returns_one()
+    test_weighter_init_unit_check()
+    test_digital_robust_v1_byteexact_matches_digital_rls()
+    test_fabric_robust_v1_close_to_fabric_rls()
+    test_digital_robust_matches_fabric_robust()
+    test_implicit_vs_unrolled_grad_robust()
+    test_impulsive_noise_burst_rate()
+    test_gaussian_control_flat_weighter()
+    print("\nAll Phase 0 + Phase 1 gates passed.")
