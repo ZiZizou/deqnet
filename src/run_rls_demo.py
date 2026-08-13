@@ -936,7 +936,8 @@ def train_robust_weighter(d, *, epochs=80, T=128, lam=0.99, sigma=0.01,
                           p_burst=0.02, kappa=20.0, device='cpu',
                           lr=1e-2, truncate_every=32, linear_max_iter=50,
                           linear_tol=1e-5, seed=0, log_every=10,
-                          save_path=None, return_history=False):
+                          save_path=None, return_history=False,
+                          backward_mode='exact'):
     """Train a ``LearnedRobustWeighter`` end-to-end on impulsive noise.
 
     Per plan decision 7 (and KIMI correction #1):
@@ -989,7 +990,8 @@ def train_robust_weighter(d, *, epochs=80, T=128, lam=0.99, sigma=0.01,
                                   R0=R0,
                                   max_iter=linear_max_iter, tol=linear_tol,
                                   beta='chebyshev', device=device,
-                                  training=True, log_every=0)
+                                  training=True, log_every=0,
+                                  backward_mode=backward_mode)
 
         loss_preq = torch.zeros((), device=device)
         for t in range(T):
@@ -1007,9 +1009,11 @@ def train_robust_weighter(d, *, epochs=80, T=128, lam=0.99, sigma=0.01,
         # ``loss_preq`` keeps its grad_fn through the last ``truncate_every``
         # steps only (the most recent chunk).  Earlier chunks are detached
         # at the next ``filter.w.detach()`` boundary because the next
-        # ``e_t`` then loses its grad_fn.  The implicit gradient (now
-        # ``phantom`` mode in ``FabricRobustRLS.step``) is cheap enough
-        # that the chain through the last chunk is tractable.
+        # ``e_t`` then loses its grad_fn.  The implicit gradient (mode
+        # ``backward_mode``, default 'exact' per the 2026-08-13 fix: the
+        # phantom VJP underflows to zero through the chained settles at
+        # production scale) is cheap enough that the chain through the
+        # last chunk is tractable.
 
         loss_term = 10.0 * (filter.w - w_o).pow(2).sum()
         loss = loss_preq + loss_term
@@ -1160,14 +1164,15 @@ def run_robust_experiment(args, out_dir, w_o, device, dtype, seed):
     else:
         print(f"  [robust] training weighter: epochs={args.robust_epochs},"
               f" T={args.robust_T}, sigma={args.sigma}, p_burst={args.p_burst},"
-              f" kappa={args.kappa}, lr={args.robust_lr}, truncate={args.truncate}")
+              f" kappa={args.kappa}, lr={args.robust_lr}, truncate={args.truncate},"
+              f" backward={args.robust_backward_mode}")
         weighter_train, history = train_robust_weighter(
             d=args.d, epochs=args.robust_epochs, T=args.robust_T,
             lam=args.lam_rls, sigma=args.sigma, p_burst=args.p_burst,
             kappa=args.kappa, device=device, lr=args.robust_lr,
             truncate_every=args.truncate,
             seed=seed, log_every=max(1, args.robust_epochs // 8),
-            return_history=True)
+            return_history=True, backward_mode=args.robust_backward_mode)
         # The trainer's solver defaults (max_iter=50, tol=1e-5) are the
         # documented float32 training policy (0b/8); we deliberately do NOT
         # pass args.linear_max_iter/linear_tol here -- those are the float64
@@ -1373,6 +1378,13 @@ def parse_args():
                         help="Optional path to a trained weighter state-dict. "
                              "If supplied and the file exists, skip training and "
                              "use the loaded weighter for evaluation.")
+    parser.add_argument('--robust_backward_mode', type=str, default='exact',
+                        choices=['phantom', 'exact'],
+                        help="Implicit gradient mode for streaming robust "
+                             "training. 'exact' (default) is the correct CG "
+                             "adjoint; 'phantom' is the cheap Geng et al. "
+                             "approximation that underflows to zero through "
+                             "chained settles at scale (2026-08-13 fix).")
     # ---- Phase 1.5: block robust IRLS ----
     parser.add_argument('--train_robust_block', action='store_true',
                         help="Run the Phase 1.5 block robust experiment: train weighter "
@@ -1391,6 +1403,15 @@ def parse_args():
                         help="Number of epochs to train the block weighter (default 80).")
     parser.add_argument('--block_lr', type=float, default=1e-2,
                         help="Adam learning rate for the block weighter (default 1e-2).")
+    parser.add_argument('--block_backward_mode', type=str, default='exact',
+                        choices=['phantom', 'exact'],
+                        help="Implicit gradient mode for block robust "
+                             "training. 'exact' (default) is the correct CG "
+                             "adjoint; 'phantom' is the cheap Geng et al. "
+                             "approximation that underflows to exactly zero "
+                             "through the chained-K settles in float32 at "
+                             "production scale, silently freezing training "
+                             "(2026-08-13 fix).")
     parser.add_argument('--block_weighter_path', type=str, default=None,
                         help="Optional path to a trained block weighter state-dict. "
                              "If supplied and the file exists, skip training and use "
@@ -1414,7 +1435,7 @@ def train_robust_weighter_block(d, *, N=512, K=8, delta=1e-2, epochs=80,
                                   device='cpu', lr=1e-2, linear_max_iter=50,
                                   linear_tol=1e-5, seed=0, log_every=10,
                                   save_path=None, return_history=False,
-                                  backward_mode='phantom'):
+                                  backward_mode='exact'):
     """Train a ``LearnedRobustWeighter`` end-to-end in *block* mode.
 
     Per plan decision 1 (Phase 1.5):
@@ -1424,8 +1445,12 @@ def train_robust_weighter_block(d, *, N=512, K=8, delta=1e-2, epochs=80,
         ``X @ w_o`` (free in simulation; plan decision 1):
             loss = ||X w^K - X w_o||^2  +  10 * ||w^K - w_o||^2
       * Float32 CPU throughout (decision 0b / 8).
-      * K settles with phantom backward (the implicit gradient is
-        biased but bounded; the bias is measured in Phase 1.5 gate 5).
+      * K settles with exact implicit backward by default (2026-08-13 fix:
+        the phantom VJP is numerically unstable through the chained-K
+        settles and underflows to exactly zero in float32 at production
+        scale d=16/N=512/K=8, silently freezing training; the exact CG
+        adjoint is sane at every size tested).  ``backward_mode='phantom'``
+        remains available for comparison via ``--block_backward_mode``.
       * No truncation needed: K is small (default 8) so backprop
         through all K settles is cheap (plan decision 2).
 
@@ -1601,13 +1626,14 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
         print(f"  [block] training weighter: epochs={args.block_epochs},"
               f" N={args.block_N}, K={args.block_K}, delta={args.block_delta},"
               f" sigma={args.sigma}, p_burst={args.p_burst},"
-              f" kappa={args.kappa}, lr={args.block_lr}")
+              f" kappa={args.kappa}, lr={args.block_lr},"
+              f" backward={args.block_backward_mode}")
         weighter_train, history = train_robust_weighter_block(
             d=args.d, N=args.block_N, K=args.block_K, delta=args.block_delta,
             epochs=args.block_epochs, sigma=args.sigma, p_burst=args.p_burst,
             kappa=args.kappa, device=device, lr=args.block_lr,
             seed=seed, log_every=max(1, args.block_epochs // 8),
-            return_history=True)
+            return_history=True, backward_mode=args.block_backward_mode)
         # Trainer solver defaults (max_iter=50, tol=1e-5) are the documented
         # float32 training policy (0b/8); args.linear_max_iter/linear_tol are
         # the float64 eval tolerances and are deliberately not forwarded.

@@ -519,6 +519,63 @@ End-to-end demo (5 train epochs, `block_metrics.json` in `results/rls_demo/robus
   K>0, but this is the open risk for Phase 2: the learning signal magnitude from
   `backward_mode='phantom'` is unreliable and the phantom direction disagrees with
   exact. Flagged for Phase 2 (measurement recorded; not tuned away per prereq #3).
+  **UPDATE 2026-08-13: this is worse than "biased" — at production scale it
+  collapses the training signal entirely (frozen weights). See the open issue
+  below.**
+
+### Open issue: phantom backward collapses at scale — training silently freezes (2026-08-13)
+
+**Symptom.** At the production config (d=16, N=512, K=8) the block weighter does not
+train: `c` and `alpha` stay bit-identical at their init values across every epoch
+(`loss.backward()` yields exactly 0.0 gradient), on **both** CPU (`ssr0`) and GPU
+(Kaggle). The identical code trains fine at the smoke config (d=8, N=128, K=4) on
+both devices.
+
+**Evidence (2×2 isolation matrix, 2026-08-13).**
+
+| config | CPU (`ssr0`) | GPU (Kaggle) |
+|---|---|---|
+| d=8, N=128, K=4 | trains: c 0.1012→0.0979, α 0.1269→0.1312 | trains: c 0.1012→0.0972, α 0.1269→0.1321 |
+| d=16, N=512, K=8 | frozen (grad=0) | frozen (grad=0) |
+
+Training histories: `results/rls_demo/robust_block/block_training_history.json`
+(CPU) and the Kaggle `robust_block_ir_rls_results*` dirs.
+
+**Why the smoke tests didn't catch it.**
+1. *Config cliff.* Every smoke gate/demo sat on the small side of the cliff: gate 5
+   measures at d=4, N=16, K=4; the ssr0 demo ran at d=8, N=128, K=4 — all on the side
+   where the float32 gradient survives. The production config (d=16, N=512, K=8) was
+   never exercised by a smoke run (the documented verification command itself used
+   `--block_N 128 --block_K 4`).
+2. *Gate 5 is a measurement, not pass/fail.* A huge `rel_bias` was reported, never
+   tripped; the gate only asserts finiteness/nonzero. A 3e10 `rel_bias` was
+   rationalized as "known phantom bias" (Geng et al.) instead of "learning signal
+   collapsed."
+3. *Precision gap between measurement and training.* The measurement runs float64
+   (phantom grad huge-but-nonzero: 5e24 at the big config); training runs float32
+   (the same computation underflows to exactly 0.0). A float64 measurement that
+   "looks alive" masked a float32 training path that is dead.
+4. *No gate asserts weights actually move.* Training success was inferred only from
+   `improvement > 0` at the small config.
+
+**Root cause.** The phantom (Geng et al.) VJP is numerically unstable through the
+chained-K block settles; instability grows with d/N/K (float64 rel_bias ≈ 3e10 at
+d=8/N=128/K=4 → ≈ 2e27 at d=16/N=512/K=8) and in float32 the chain gradient
+underflows to exactly 0. The exact (CG) adjoint is sane at every size tested
+(grad ≈ 1e-3…2e-3).
+
+**Fix (APPLIED + VERIFIED 2026-08-13).** `train_robust_weighter_block` and
+`train_robust_weighter` now default to `backward_mode='exact'` — the true implicit
+gradient, cheap at d=16 (one small adjoint solve per settle). New CLI flags
+`--block_backward_mode` / `--robust_backward_mode` (default `exact`, choice
+`phantom`/`exact`) keep the phantom mode runnable for comparison. **Verification on
+the production config** (d=16, N=512, K=8, CPU, 5 epochs): weights now move from
+epoch 0 (c 0.1012→0.0968, alpha 0.1269→0.1326, previously frozen at exactly the
+init), and `learned < init < plain` at every K>0 (e.g. K=8: 1.70e-5 vs 1.75e-5 vs
+2.84e-5) and at every N. All 18 gates + `tests/run_all.py` still green. The
+`phantom_vs_exact` measurement still reports the phantom bias (rel_bias ≈ 3e27 at
+the big config) — that is the gate's measurement of the approximation error, now
+decoupled from the training signal.
 
 ## Phase 2 — Learned-Prox ISTA (equalizer framing)
 
