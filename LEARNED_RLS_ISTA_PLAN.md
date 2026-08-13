@@ -8,7 +8,21 @@ Progress: **Phase 0 + Phase 1 gates PASSED** (2026-08-11). `src/tests/test_learn
 (13 tests: 4 Phase 0 + 9 Phase 1) is fully green on `ssr0`. The end-to-end
 `run_rls_demo.py --train_robust` runs (training + 4 contenders, all settle ≤6 iters).
 One small test parameter change (gate 6: T=32 → T=8 to keep the implicit-backward
-forward chain tractable on CPU at default tolerances; documented below). Next: Phase 2.
+forward chain tractable on CPU at default tolerances; documented below).
+
+**Phase 1 relabeled (2026-08-12):** Phase 1 as built is the *streaming* robust
+RLS design — a legitimate adaptive-filter baseline, but not the block-equilibrium
+thesis of the paper (per-sample settling = T settles/block + O(d²) digital work per
+symbol). It stands as the **streaming baseline contender** only.
+
+**Phase 1.5 IMPLEMENTED + VERIFIED (2026-08-12):** Block Robust IRLS — the
+block-parallel reconciliation — is coded and green. All 18 gates pass on `ssr0`
+(4 Phase 0 + 9 Phase 1 + 5 Phase 1.5), `tests/run_all.py` is fully green
+(`batch_experiment_metrics` restored), and the end-to-end
+`run_rls_demo.py --train_robust_block --noise impulsive` demo runs, writing
+`results/rls_demo/robust_block/` (K-sweep learned < plain at every K>0, N-sweep
+learned < plain at every N, trained-config phantom-vs-exact bias reported).
+Evidence in the Phase 1.5 section below. Next: Phase 1.5 → Phase 2.
 
 Two critiques before the plan, because they change the design:
 
@@ -236,6 +250,9 @@ Build order: noise plumbing → `learned_robust.py` → training/eval wiring →
       `python tests/run_all.py` (existing 40 unchanged; pre-existing
       `test_batch_rls` `batch_experiment_metrics` body is missing its `return`
       statement — out of Phase 1 scope, reported as a pre-existing bug).
+      **Correction (2026-08-12):** this was NOT pre-existing — git shows commit
+      93b8e17 deleted the `out = {…}; return out` block that c817644 had. It is a
+      Phase-1 regression, to be restored in the Phase 1.5 prerequisites.
 
 ### Phase 1 — bugs found and fixed during implementation (2026-08-11)
 
@@ -309,10 +326,11 @@ prevented the gates from running end-to-end. Resolved before Phase 1 signoff:
     `robust_metrics.json`, `robust_training_history.json`, `robust_weighter.pt`,
     `settling_budget.png`.
 
-`python tests/run_all.py` (existing 40 unchanged): all green except the pre-existing
-`test_batch_rls::test_batch_fabric_matches_lstsq` failure, which is unrelated to
-this work (the `batch_experiment_metrics` function body is missing its `return`
-statement in the prior commit; left for a separate fix).
+`python tests/run_all.py` (existing 40 unchanged): all green except
+`test_batch_rls::test_batch_fabric_matches_lstsq`, which fails because the
+`batch_experiment_metrics` function body is missing its `return` statement
+(out of Phase 1 scope; **correction 2026-08-12: this is a Phase-1 regression from
+commit 93b8e17, not pre-existing — restore it in the Phase 1.5 prerequisites**).
 
 ### Risks (report honestly, do not tune away)
 
@@ -320,6 +338,187 @@ statement in the prior commit; left for a separate fix).
   finiteness checked.
 - Weighter may not beat plain RLS under impulsive noise — that is a reported result, not a
   bug to silence (gate 6 is the control that keeps this honest).
+
+## Phase 1.5 — Block Robust IRLS (single-settle reconcile)
+
+Status: **implemented + verified (2026-08-12).** All prerequisites, code, and 5
+gates are in; the full 18-gate file and `tests/run_all.py` are green on `ssr0`,
+and the end-to-end block demo produced `results/rls_demo/robust_block/`.
+Audit findings fixed in the same pass (see "Audit findings + fixes" below).
+
+### Why (the framing correction)
+
+Phase 1 is a *streaming* robust RLS: one `LinearSolveLayer` settle per symbol
+(T settles per T-length block) plus O(d²) digital accumulation per symbol. That is
+a legitimate classical adaptive-filter design point (it sits next to LMS in the
+taxonomy) and a correct correctness milestone: implicit-gradient plumbing, weighter
+trainability, digital-twin parity, and the gate suite all transfer directly to the
+block version. But it is **not** the block-equilibrium thesis:
+
+- An ASIC receives one symbol stream; per-sample settling means **T settles per
+  block** (T=512) vs. the block design's **K settles** (K≈5–20 outer iterations).
+  At τ ~ RC per settle, that is a ~25–100× latency multiplier — the "sequential
+  sample-by-sample adaptation prohibited by clock limits" the block framing rejects.
+- The digital accumulation `R ← λR + v_t xxᵀ` per sample is O(d²) digital work at
+  symbol rate — the thing the fabric was supposed to eliminate.
+
+Phase 1 is therefore relabeled the **streaming robust RLS baseline**. Phase 1.5
+adds the block form; Phase 2 (learned-prox ISTA) is already block-structured
+(`X` is a block Toeplitz, one equilibrium per block). After 1.5, both learned
+algorithms share the same block-equilibrium skeleton — one fabric, two learned
+components (weights, prox), same settle primitive.
+
+### The construction
+
+Robust weighting is inherently iterative (v depends on residuals, residuals on w),
+so a truly single settle for robust RLS is impossible in the naive sense — but the
+sequential dependency is across **K outer iterations, not T samples**. Weights are
+block-parallel:
+
+```python
+def block_robust_rls(X, d, weighter, delta, K, settle, w_init=None):
+    # X: (T, d) block regressor, d: (T,) observations, T = block length
+    R0 = X.T @ X + delta * torch.eye(d)
+    w  = settle(R0, X.T @ d, v0=w_init)           # settle 1: plain batch LS
+    for k in range(K):
+        e  = d - X @ w                            # (T,), vectorized over the block
+        v  = weighter(e)                          # (T,) block-parallel weights
+        R  = X.T @ (v[:, None] * X) + delta * torch.eye(d)
+        p  = X.T @ (v * d)
+        w  = settle(R, p, v0=w.detach())          # 1 settle per outer iter, warm-started
+    return w                                      # K+1 settles, independent of T
+```
+
+| | Streaming robust RLS (Phase 1) | Block robust IRLS (Phase 1.5) |
+|---|---|---|
+| Weighting | per-sample `v_t = v(e_prior)` | block-parallel `v = weighter(d − X w)` |
+| Solve cadence | 1 settle per sample | 1 settle per outer iter |
+| Settles per block (T=512) | T = 512 | K+1 ≈ 9 |
+| Digital work | O(d²) per sample at symbol rate | O(T·d²) amortized, block-parallel |
+
+### Design decisions (locked 2026-08-12)
+
+1. **Supervision.** Train against the noiseless block symbols `X w_o` (free in
+   simulation): loss = `‖X w^K − X w_o‖²` (+ optional `10·‖w^K − w_o‖²` terminal).
+   Do NOT supervise against the noisy `d`.
+2. **No truncation needed.** Each settle uses `LinearSolveLayer`'s implicit
+   backward, so weighter gradients flow through the K outer iterations; K is small
+   (default 8), so backprop through all K settles is cheap — no truncated BPTT.
+3. **Digital twin.** `digital_block_robust_rls` via `torch.linalg.solve`; the
+   `v≡1` limit ⇒ block IRLS ≡ plain batch RLS (parity gate reuses the restored
+   `batch_experiment_metrics` path).
+4. **Gates live in `tests/test_learned_robust.py`** (same subsystem). No
+   `run_all.py` registration change (Phase 3).
+5. **Coupled (w, v) single settle = DEFERRED research note, not implemented.**
+   The full joint fixed point `f(w,v) = [p(v) − R(v)w, weighter(d − Xw) − v]`
+   would restore the literal single-settle claim, but its Jacobian has genuinely
+   interesting cross terms (`∂R(v)w/∂v`, `−diag(ψ′(e))X`) and a redescending
+   `ψ′ < 0` interacting with the coupling. Contraction analysis only; revisit only
+   after block IRLS is verified.
+
+### Prerequisites (Phase 1.5 bug list — Phase 1 regressions, not pre-existing)
+
+- [x] **Restore `batch_experiment_metrics` return.** Commit c817644 ("Added batch
+  mode") ended the function with a full `out = {…}` dict and `return out`. Commit
+  93b8e17 ("Added learned IR-RLS") **deleted that block**, so the function returns
+  `None` and `run_batch_experiment` (`m['trial'] = trial`) and
+  `test_batch_rls::test_batch_fabric_matches_lstsq` crash. The earlier Phase-1
+  verification text calling this "pre-existing" is **wrong** — git-verified as a
+  Phase-1 regression. Restore verbatim from c817644; re-run `tests/run_all.py` green.
+  **DONE — restored; `run_all.py` green; gate 1 now also exercises the restored path.**
+- [x] **Delete stray `src/1`** (31 KB captured test output, untracked).
+  **DONE — file already absent on `ssr0`.**
+- [x] **Phantom-vs-exact measurement gate.** Training uses `backward_mode='phantom'`
+  but every existing gate validates only the exact (CG) adjoint (~1e-10). The
+  gradient actually used for learning is unverified. Add a gate measuring
+  `rel_bias = ‖g_phantom − g_exact‖ / ‖g_exact‖` on the trained configuration and
+  **report** it into `robust_metrics.json` — a measurement, not a pass/fail bound
+  (phantom is biased by construction; report the bias, don't tune it away).
+  **DONE — `measure_phantom_vs_exact_bias` in `learned_robust.py`, gate 5 + driver
+  report into `block_metrics.json` at the trained operating point.**
+- [x] **Gate-4 precision context.** The ~7.65e-11 implicit-vs-unrolled number is only
+  interpretable at float64 / solver tol 1e-10 — state that in the gate output.
+  **DONE — gate prints `precision=float64 / solver tol 1e-10`.**
+
+### Implementation build order
+
+1. Prerequisite fixes above (own commit). — **DONE (2026-08-12)**
+2. `make_block` (block generator, reuses `_make_noise`) + `block_robust_rls` +
+   `digital_block_robust_rls` in `src/utils/learned_robust.py`. — **DONE**
+3. `src/run_rls_demo.py`: `train_robust_weighter_block` (per-epoch random plant,
+   N=512, K=8, float32, loss = MSE on `X·w^K` vs `X·w_o`), `run_robust_block_experiment`
+   (contenders: plain batch LS, learned block IRLS, init-only block IRLS, streaming
+   `fabric_robust_rls`; plots MSE-vs-K, MSE-vs-N, settle-iter counts) →
+   `results/rls_demo/robust_block/`. — **DONE**
+4. argparse: `--train_robust_block --block_N 512 --block_K 8 --block_delta 1e-2
+   --block_epochs --block_lr`; wire into `run_experiment` after `--batch_only`. — **DONE**
+5. Gates (below). — **DONE (5 gates, all green)**
+6. Append verification evidence to this section. — **DONE below**
+
+### Audit findings + fixes (2026-08-12, same pass as Phase 1.5)
+
+1. **Gate 6 was vacuous** (`test_gaussian_control_flat_weighter`): computed `var_v`
+   but asserted nothing. Now `assert var_v < 5e-3` (measured 1.83e-4).
+2. **float32 training policy violated** in the streaming `train_robust_weighter`:
+   `run_experiment` sets `torch.set_default_dtype(torch.float64)` before weighter
+   creation, so the weighter minted float64 and silently promoted the whole training
+   graph. Both streaming and block trainers now mint `weighter.to(torch.float32)`.
+3. **Training-time linear-solver overrides removed**: the drivers forwarded
+   `args.linear_max_iter`/`args.linear_tol` into the trainers, contradicting the
+   locked policy (trainer solves run at defaults 50/1e-5). The trainers now run at
+   policy defaults.
+4. **Gate 3 docstring/code contradiction**: docstring said "doesn't fail-loud" while
+   the code asserted `improvement > 0.01`. Honest gate = assert `improvement > 0`
+   (must beat plain LS) and report the margin; fails loudly. Measured 40.53%.
+5. **Gate 1** now compares against the reference through the restored
+   `batch_experiment_metrics` path instead of a raw `torch.linalg.solve` (rel_err
+   5e-15).
+6. **Settle-iter histogram bug**: `block_mse` recorded only the *last* settle's
+   `n_iter` per block. `block_robust_rls` now accepts `settle_log` and records all
+   K+1 settles (`EquilibriumSolve.last_info`).
+7. **Phantom-vs-exact bias measured at init, not trained config** (prereq #3): now
+   measured via a shared `measure_phantom_vs_exact_bias` helper at the *trained*
+   weighter in both the gate and the demo driver (`operating_point: "trained weighter"`).
+
+### Gates (5, in `tests/test_learned_robust.py`) — **ALL PASS (2026-08-12)**
+
+1. `test_block_robust_v1_matches_batch_ls` — `v≡1` ⇒ block IRLS == plain batch
+   RLS to solver tolerance (uses the restored metrics path). — **rel_err 5.0e-15,
+   normal_eq_res 5.2e-13**
+2. `test_block_robust_digital_matches_fabric` — digital vs fabric block twins
+   `<1e-5`. — **rel 1.8e-15**
+3. `test_block_robust_impulsive_improvement` — learned block IRLS beats plain
+   batch LS on impulsive noise (honest result gate; report, don't tune).
+   — **mse_plain 9.53e-5 → mse_learned 5.67e-5, improvement 40.5%**
+4. `test_block_robust_grad_flow` — `raw_c.grad` finite/nonzero after backprop
+   through K settles; exact implicit-vs-unrolled `<1e-4` (float64, tol 1e-10).
+   — **rel_err 1.5e-9**
+5. `test_phantom_vs_exact_bias` — measurement gate (prerequisite #3).
+   — **measured at trained config: g_phantom 5.97e-5 vs g_exact −6.04e-7,
+   rel_bias ≈ 1e2, signs disagree. Reported, not pass/fail (phantom is biased
+   by construction; see driver measurement below for the demo operating point).**
+
+### Verification (on `ssr0`) — **GREEN 2026-08-12**
+
+```bash
+python tests/test_learned_robust.py   # 13 + 5 = 18 gates — ALL PASS
+python tests/run_all.py               # batch parity now green — ALL TESTS PASSED
+python run_rls_demo.py --train_robust_block --noise impulsive --n_trials 2 --block_N 128 --block_K 4
+```
+
+End-to-end demo (5 train epochs, `block_metrics.json` in `results/rls_demo/robust_block/`):
+
+- K-sweep (N=128): plain 6.75e-5 / 7.46e-5 / 1.46e-5 / 1.13e-4 / 6.33e-5 / 4.11e-5,
+  learned 6.75e-5 / 4.69e-5 / 1.18e-5 / 7.17e-5 / 4.25e-5 / 2.95e-5 — **learned < plain
+  at every K > 0**.
+- N-sweep (K=4): learned < plain at every N (32…512); streaming baseline is worse at
+  small N (1.9e-3 @ N=32) as expected.
+- Phantom-vs-exact at the trained weighter (c=0.098, alpha=0.131): **rel_bias ≈ 5.3e10**
+  (g_phantom 7.8e7 vs g_exact 1.5e-3) — the chained-K phantom VJP is far off in
+  magnitude at the trained operating point. Training still improves MSE at every
+  K>0, but this is the open risk for Phase 2: the learning signal magnitude from
+  `backward_mode='phantom'` is unreliable and the phantom direction disagrees with
+  exact. Flagged for Phase 2 (measurement recorded; not tuned away per prereq #3).
 
 ## Phase 2 — Learned-Prox ISTA (equalizer framing)
 
@@ -356,17 +555,20 @@ Tests (gates):
 
 ## Phase 3 — Consolidation
 
-- Register both new test modules in `src/tests/run_all.py`.
+- Register the new test modules in `src/tests/run_all.py` (learned_robust incl.
+  Phase 1.5 block gates, learned_ista).
 - Full acceptance on `ssr0`:
   - `ssh ssr0 "cd ~/Documents/deqnet/src && python tests/run_all.py"` (existing 40 + new).
   - `ssh ssr0 "cd ~/Documents/deqnet/src && python run_rls_demo.py --noise impulsive --train_robust"`
+  - `ssh ssr0 "cd ~/Documents/deqnet/src && python run_rls_demo.py --train_robust_block --noise impulsive"`
   - `ssh ssr0 "cd ~/Documents/deqnet/src && python run_rls_demo.py --train_ista"`
 - Save figures + JSON to `results/rls_demo/robust/` and `results/rls_demo/ista/`.
 - Update `.opencode_memory.md` with new modules and the corrected recursions.
 
-**Order:** Phase 0 → 1 → 2 → 3. Phase 0 is done; the predicted gradcheck risk materialized as an API
+**Order:** Phase 0 → 1 → 1.5 → 2 → 3. Phase 0 is done; the predicted gradcheck risk materialized as an API
 incompatibility (not a bug) plus one real bug in `EquilibriumSolve.backward` (finding E), both resolved.
-Phase 1 is next.
+Phase 1 is done (now the *streaming* baseline); Phase 1.5 (Block Robust IRLS) is done and verified (2026-08-12).
+Phase 2 (Learned-Prox ISTA) is next — carrying the flagged phantom-gradient risk (see Phase 1.5 verification).
 
 ## Test checklist (gates, not suggestions)
 
@@ -386,16 +588,20 @@ Phase 1 is next.
 ```
 src/
 ├── utils/
-│   ├── learned_robust.py       # LearnedRobustWeighter, FabricRobustRLS, DigitalRobustRLS (new)
+│   ├── learned_robust.py       # LearnedRobustWeighter, FabricRobustRLS, DigitalRobustRLS (Phase 1, DONE);
+│   │                           #   + block_robust_rls, digital_block_robust_rls, make_block,
+│   │                           #     measure_phantom_vs_exact_bias (Phase 1.5, DONE)
 │   └── learned_ista.py         # MonotonePenalty, FabricLearnedISTA,
-│                               #   generate_wireline_block, build_toeplitz (new)
+│   │                           #   generate_wireline_block, build_toeplitz (new)
 ├── tests/
-│   ├── test_learned_robust.py  # Phase 0 gate: grad flow + FD gradcheck + weighter sim (DONE; gates 1,2,4,6
-│   │                           #   + impulsive-noise stats come later in Phase 1)
+│   ├── test_learned_robust.py  # Phase 0 gate: grad flow + FD gradcheck + weighter sim (DONE); Phase 1:
+│   │                           #   gates 1,2,4,6 + impulsive-noise stats (DONE); Phase 1.5: 5 block gates
+│   │                           #   incl. phantom-vs-exact measurement + restored batch parity (DONE)
 │   ├── test_learned_ista.py    # gates 3,4,5 + generator shapes (new)
-│   └── run_all.py              # register the two new modules
+│   └── run_all.py              # register the new test modules
 └── run_rls_demo.py             # _make_noise/make_stream noise arg, train_robust_weighter,
                                 #   run_robust_experiment, train_learned_ista, run_ista_experiment,
+                                #   train_robust_weighter_block, run_robust_block_experiment (Phase 1.5, DONE),
                                 #   argparse flags, plotting, header precision policy
 ```
 ---

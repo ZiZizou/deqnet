@@ -304,6 +304,17 @@ def batch_experiment_metrics(w_fabric, R, p, X, d, R0, w_o=None, weight=1.0):
     # (no arbitrary 0.5 scaling).
     obj = (weight * (X @ w_fabric - d).pow(2).sum()
            + w_fabric @ R0 @ w_fabric).item()
+    out = {
+        'abs_err': abs_err,
+        'rel_err': rel_err,
+        'normal_eq_residual': normal_res,
+        'regularized_objective': obj,
+        'w_ref': w_ref.detach().cpu(),
+        'w_fabric': w_fabric.detach().cpu(),
+    }
+    if w_o is not None:
+        out['plant_error'] = (w_fabric - w_o).pow(2).sum().item()
+    return out
 # ----------------------------------------------------------------------------
 # 2. Stream generators
 # ----------------------------------------------------------------------------
@@ -766,6 +777,10 @@ def run_experiment(args):
         run_batch_experiment(args, out_dir, w_o, device, dtype, args.seed)
         return
 
+    if args.train_robust_block:
+        run_robust_block_experiment(args, out_dir, w_o, device, dtype, args.seed)
+        return
+
     if args.train_robust:
         run_robust_experiment(args, out_dir, w_o, device, dtype, args.seed)
         return
@@ -948,6 +963,11 @@ def train_robust_weighter(d, *, epochs=80, T=128, lam=0.99, sigma=0.01,
 
     torch.manual_seed(seed)
     weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0).to(device)
+    # Precision policy (0b/8): training runs float32 CPU.  Cast the params
+    # explicitly -- ``run_experiment`` has already set the default dtype to
+    # float64, which would otherwise mint a float64 weighter and silently
+    # promote the whole training graph (the stream is float32).
+    weighter = weighter.to(torch.float32)
     optimizer = torch.optim.Adam(weighter.parameters(), lr=lr)
     history = []
 
@@ -1146,9 +1166,12 @@ def run_robust_experiment(args, out_dir, w_o, device, dtype, seed):
             lam=args.lam_rls, sigma=args.sigma, p_burst=args.p_burst,
             kappa=args.kappa, device=device, lr=args.robust_lr,
             truncate_every=args.truncate,
-            linear_max_iter=args.linear_max_iter, linear_tol=args.linear_tol,
             seed=seed, log_every=max(1, args.robust_epochs // 8),
             return_history=True)
+        # The trainer's solver defaults (max_iter=50, tol=1e-5) are the
+        # documented float32 training policy (0b/8); we deliberately do NOT
+        # pass args.linear_max_iter/linear_tol here -- those are the float64
+        # eval tolerances (1e-8) used by the frozen-weighter contenders below.
         with open(os.path.join(out_dir, 'robust_training_history.json'), 'w') as f:
             json.dump(history, f, indent=2)
         # Save the trained weighter for reuse.
@@ -1350,7 +1373,475 @@ def parse_args():
                         help="Optional path to a trained weighter state-dict. "
                              "If supplied and the file exists, skip training and "
                              "use the loaded weighter for evaluation.")
+    # ---- Phase 1.5: block robust IRLS ----
+    parser.add_argument('--train_robust_block', action='store_true',
+                        help="Run the Phase 1.5 block robust experiment: train weighter "
+                             "end-to-end on (X, d_obs) block regression with K outer "
+                             "IRLS iterations, then evaluate contenders "
+                             "(plain batch LS, learned block IRLS, init-only block IRLS, "
+                             "streaming fabric_robust_rls).")
+    parser.add_argument('--block_N', type=int, default=512,
+                        help="Block size N for the block robust experiment (default 512).")
+    parser.add_argument('--block_K', type=int, default=8,
+                        help="Number of outer IRLS iterations K (default 8).")
+    parser.add_argument('--block_delta', type=float, default=1e-2,
+                        help="Identity regularization for the block R0 = delta * I "
+                             "(default 1e-2).")
+    parser.add_argument('--block_epochs', type=int, default=80,
+                        help="Number of epochs to train the block weighter (default 80).")
+    parser.add_argument('--block_lr', type=float, default=1e-2,
+                        help="Adam learning rate for the block weighter (default 1e-2).")
+    parser.add_argument('--block_weighter_path', type=str, default=None,
+                        help="Optional path to a trained block weighter state-dict. "
+                             "If supplied and the file exists, skip training and use "
+                             "the loaded weighter for evaluation.")
+    parser.add_argument('--block_K_max', type=int, nargs='+', default=None,
+                        help="K values for the K-sweep (default 0 1 2 4 8 16).")
+    parser.add_argument('--block_N_max', type=int, nargs='+', default=None,
+                        help="N values for the N-sweep (default 32 64 128 256 512).")
     return parser.parse_args()
+
+
+
+
+# ----------------------------------------------------------------------------
+# 9. Phase 1.5: Block Robust IRLS (training + experiment)
+# ----------------------------------------------------------------------------
+
+
+def train_robust_weighter_block(d, *, N=512, K=8, delta=1e-2, epochs=80,
+                                  sigma=0.01, p_burst=0.02, kappa=20.0,
+                                  device='cpu', lr=1e-2, linear_max_iter=50,
+                                  linear_tol=1e-5, seed=0, log_every=10,
+                                  save_path=None, return_history=False,
+                                  backward_mode='phantom'):
+    """Train a ``LearnedRobustWeighter`` end-to-end in *block* mode.
+
+    Per plan decision 1 (Phase 1.5):
+      * Per-epoch randomized plant w_o (unit norm).
+      * Block size N=512, K=8 outer IRLS iterations.
+      * Loss supervises against the noiseless block symbols
+        ``X @ w_o`` (free in simulation; plan decision 1):
+            loss = ||X w^K - X w_o||^2  +  10 * ||w^K - w_o||^2
+      * Float32 CPU throughout (decision 0b / 8).
+      * K settles with phantom backward (the implicit gradient is
+        biased but bounded; the bias is measured in Phase 1.5 gate 5).
+      * No truncation needed: K is small (default 8) so backprop
+        through all K settles is cheap (plan decision 2).
+
+    Returns the trained weighter (in ``eval()`` mode).  When
+    ``return_history=True`` also returns a list of dicts with per-epoch
+    metrics (loss, plant_error, c, alpha).
+    """
+    # Lazy import (plan decision 9).
+    from utils.learned_robust import (
+        block_robust_rls, LearnedRobustWeighter, make_block,
+    )
+
+    torch.manual_seed(seed)
+    weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0).to(device)
+    # Precision policy (0b/8): training runs float32 CPU.  Cast explicitly
+    # (see train_robust_weighter): run_experiment's default-dtype float64
+    # would otherwise mint a float64 weighter and promote the whole graph.
+    weighter = weighter.to(torch.float32)
+    optimizer = torch.optim.Adam(weighter.parameters(), lr=lr)
+    history = []
+
+    for epoch in range(epochs):
+        # Random unit-norm plant per epoch (KIMI audit #1 keeps the
+        # weighter focused on the burst physics, not on a particular w_o).
+        w_o = torch.randn(d, device=device, dtype=torch.float32)
+        w_o = w_o / w_o.norm()
+
+        # Block regressor and noisy observations (float32 training).
+        X, d_obs = make_block(w_o, N, sigma, mode='iid',
+                              noise='impulsive', p_burst=p_burst,
+                              kappa=kappa, seed=seed + epoch,
+                              dtype=torch.float32, device=device)
+
+        # Run K+1 settles: 1 plain batch LS + K IRLS outer iterations.
+        w_K = block_robust_rls(X, d_obs, weighter, delta=delta, K=K,
+                               max_iter=linear_max_iter, tol=linear_tol,
+                               backward_mode=backward_mode)
+
+        # Loss: ||X w^K - X w_o||^2 + 10 * ||w^K - w_o||^2.
+        loss_data = (X @ w_K - X @ w_o).pow(2).sum()
+        loss_term = 10.0 * (w_K - w_o).pow(2).sum()
+        loss = loss_data + loss_term
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            c_here = weighter.c.item()
+            alpha_here = weighter.alpha.item()
+        rec = {
+            'epoch': epoch,
+            'loss': float(loss.item()),
+            'loss_data': float(loss_data.item()),
+            'loss_term': float(loss_term.item()),
+            'plant_error': float((w_K - w_o).pow(2).sum().item()),
+            'data_error': float((X @ w_K - X @ w_o).pow(2).sum().item() / N),
+            'c': float(c_here),
+            'alpha': float(alpha_here),
+        }
+        history.append(rec)
+        if log_every and (epoch % log_every == 0 or epoch == epochs - 1):
+            print(f"  [train_block] epoch {epoch:4d}"
+                  f"  loss={rec['loss']:.4e}"
+                  f"  data={rec['data_error']:.4e}"
+                  f"  plant={rec['plant_error']:.4e}"
+                  f"  c={c_here:.4f}  alpha={alpha_here:.4f}",
+                  flush=True)
+
+    if save_path is not None:
+        torch.save(weighter.state_dict(), save_path)
+        print(f"  [train_block] saved weighter to {save_path}")
+
+    weighter.eval()
+    if return_history:
+        return weighter, history
+    return weighter
+
+
+def plot_block_mse_vs_K(out_dir, K_values, mse_plain, mse_learned, mse_init):
+    """Plot MSE-vs-K for the three block contenders (one curve per contender)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.semilogy(K_values, mse_plain, 'o-', color='C1', label='plain batch LS',
+                linewidth=1.5)
+    ax.semilogy(K_values, mse_learned, 's-', color='C3', label='learned block IRLS',
+                linewidth=1.5)
+    ax.semilogy(K_values, mse_init, '^--', color='C0', label='init-only block IRLS',
+                linewidth=1.5, alpha=0.7)
+    ax.set_xlabel('K (outer IRLS iterations)')
+    ax.set_ylabel(r'MSE $= \|X w^K - X w_o\|^2 / N$')
+    ax.set_title('Block robust IRLS: MSE vs K')
+    ax.legend()
+    ax.grid(True, which='both', alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, 'robust_block_mse_vs_K.png'), dpi=140)
+    plt.close(fig)
+
+
+def plot_block_mse_vs_N(out_dir, N_values, mse_plain, mse_learned, mse_streaming):
+    """Plot MSE-vs-N for the block contenders and the streaming baseline."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.semilogy(N_values, mse_plain, 'o-', color='C1', label='plain batch LS',
+                linewidth=1.5)
+    ax.semilogy(N_values, mse_learned, 's-', color='C3', label='learned block IRLS',
+                linewidth=1.5)
+    ax.semilogy(N_values, mse_streaming, 'v--', color='C5',
+                label='streaming fabric_robust_rls', linewidth=1.5, alpha=0.7)
+    ax.set_xlabel('block size N')
+    ax.set_ylabel(r'MSE $= \|X w^K - X w_o\|^2 / N$')
+    ax.set_title('Block robust IRLS: MSE vs N')
+    ax.legend()
+    ax.grid(True, which='both', alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, 'robust_block_mse_vs_N.png'), dpi=140)
+    plt.close(fig)
+
+
+def plot_block_settle_iter_histogram(out_dir, all_iters, K, N):
+    """Histogram of settle iters per (K+1) settle pair across (K, N) sweep."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.hist(all_iters, bins=20, color='C3', alpha=0.8,
+            label=f'settles (K={K}, N={N})')
+    ax.set_xlabel('LinearSolveLayer iterations per settle')
+    ax.set_ylabel('count')
+    ax.set_title('Block robust IRLS: settle iterations')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, 'robust_block_settle_iters.png'), dpi=140)
+    plt.close(fig)
+
+
+def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
+    """Phase 1.5 block robust experiment: 4 contenders under impulsive noise.
+
+    Contenders:
+      1. plain batch LS             (the K=0 limit, no weighter)
+      2. learned block IRLS         (frozen weighter, K+1 settles)
+      3. init-only block IRLS       (weighter at init, K+1 settles)
+      4. streaming fabric_robust_rls (T settles, O(d^2) per sample)
+
+    Plots:
+      * robust_block_mse_vs_K.png   -- MSE vs K (all three block contenders)
+      * robust_block_mse_vs_N.png   -- MSE vs N (block vs streaming)
+      * robust_block_settle_iters.png -- LinearSolveLayer iter distribution
+    """
+    # Lazy import (plan decision 9).
+    from utils.learned_robust import (
+        block_robust_rls, digital_block_robust_rls, FabricRobustRLS,
+        LearnedRobustWeighter, constant_weighter, make_block,
+    )
+
+    block_dir = os.path.join(out_dir, 'robust_block')
+    _ensure_dir(block_dir)
+
+    # ---- Train or load block weighter ----
+    weighter_train = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    if args.block_weighter_path and os.path.exists(args.block_weighter_path):
+        sd = torch.load(args.block_weighter_path, map_location='cpu')
+        weighter_train.load_state_dict(sd)
+        print(f"  [block] loaded trained weighter from {args.block_weighter_path}")
+        history = []
+    else:
+        print(f"  [block] training weighter: epochs={args.block_epochs},"
+              f" N={args.block_N}, K={args.block_K}, delta={args.block_delta},"
+              f" sigma={args.sigma}, p_burst={args.p_burst},"
+              f" kappa={args.kappa}, lr={args.block_lr}")
+        weighter_train, history = train_robust_weighter_block(
+            d=args.d, N=args.block_N, K=args.block_K, delta=args.block_delta,
+            epochs=args.block_epochs, sigma=args.sigma, p_burst=args.p_burst,
+            kappa=args.kappa, device=device, lr=args.block_lr,
+            seed=seed, log_every=max(1, args.block_epochs // 8),
+            return_history=True)
+        # Trainer solver defaults (max_iter=50, tol=1e-5) are the documented
+        # float32 training policy (0b/8); args.linear_max_iter/linear_tol are
+        # the float64 eval tolerances and are deliberately not forwarded.
+        with open(os.path.join(block_dir, 'block_training_history.json'), 'w') as f:
+            json.dump(history, f, indent=2)
+        save_path = os.path.join(block_dir, 'block_weighter.pt')
+        torch.save(weighter_train.state_dict(), save_path)
+        print(f"  [block] saved trained weighter to {save_path}")
+
+    # Cast frozen weighter to eval dtype (decision 10: train float32, eval float64).
+    weighter = weighter_train.to(device).to(dtype)
+    weighter.eval()
+    const_w = constant_weighter(1.0, dtype=dtype).to(device)
+    init_w = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0).to(device).to(dtype)
+    init_w.eval()
+
+    # ---- Generate blocks for the K-sweep and N-sweep ----
+    # K-sweep: fix N at args.block_N, sweep K.
+    # N-sweep: fix K at args.block_K, sweep N.
+    K_values = [0, 1, 2, 4, 8, 16] if args.block_K_max is None else list(args.block_K_max)
+    N_values = [32, 64, 128, 256, 512] if args.block_N_max is None else list(args.block_N_max)
+
+    def make_block_fixed(seed_):
+        torch.manual_seed(seed_)
+        if device.type == 'cuda':
+            torch.cuda.manual_seed(seed_)
+        w_o_l = torch.randn(args.d, device=device, dtype=dtype)
+        w_o_l = w_o_l / w_o_l.norm()
+        return w_o_l
+
+    def block_mse(weighter_, X, d_obs, w_o_l, K_l, delta_l):
+        """Run block IRLS with K iterations and return (mse, settle_iters).
+
+        ``settle_log`` collects the n_iter of every settle (K+1 of them),
+        not just the final one, so the histogram reflects the full block
+        settle cost.
+        """
+        settle_iters = []
+        w = block_robust_rls(X, d_obs, weighter_, delta=delta_l, K=K_l,
+                             max_iter=args.linear_max_iter,
+                             tol=args.linear_tol,
+                             backward_mode='phantom',
+                             settle_log=settle_iters)
+        mse = float(((X @ w - X @ w_o_l).pow(2)).mean().item())
+        return mse, settle_iters, w
+
+    # ---- K-sweep ----
+    print(f"\n=== Block robust: K-sweep, N={args.block_N}, "
+          f"noise={args.noise}, sigma={args.sigma} ===", flush=True)
+    k_sweep_plain = []
+    k_sweep_learned = []
+    k_sweep_init = []
+    k_sweep_iters = []
+    n_trials = max(1, args.n_trials)
+    for K_l in K_values:
+        mse_plain_acc = 0.0
+        mse_learned_acc = 0.0
+        mse_init_acc = 0.0
+        for trial in range(n_trials):
+            w_o_l = make_block_fixed(seed + trial * 1000 + K_l)
+            X, d_obs = make_block(w_o_l, args.block_N, args.sigma, mode='iid',
+                                  noise=args.noise, p_burst=args.p_burst,
+                                  kappa=args.kappa, seed=seed + trial * 1000 + K_l,
+                                  dtype=dtype, device=device)
+            mse_p, _, _ = block_mse(const_w, X, d_obs, w_o_l, K_l, args.block_delta)
+            mse_l, it_l, _ = block_mse(weighter, X, d_obs, w_o_l, K_l, args.block_delta)
+            mse_i, _, _ = block_mse(init_w, X, d_obs, w_o_l, K_l, args.block_delta)
+            mse_plain_acc += mse_p
+            mse_learned_acc += mse_l
+            mse_init_acc += mse_i
+            k_sweep_iters.extend(it_l)
+        k_sweep_plain.append(mse_plain_acc / n_trials)
+        k_sweep_learned.append(mse_learned_acc / n_trials)
+        k_sweep_init.append(mse_init_acc / n_trials)
+        print(f"  K={K_l:2d}: plain={k_sweep_plain[-1]:.4e}  "
+              f"learned={k_sweep_learned[-1]:.4e}  "
+              f"init={k_sweep_init[-1]:.4e}", flush=True)
+
+    plot_block_mse_vs_K(block_dir, K_values, k_sweep_plain, k_sweep_learned,
+                         k_sweep_init)
+
+    # ---- N-sweep ----
+    print(f"\n=== Block robust: N-sweep, K={args.block_K}, "
+          f"noise={args.noise}, sigma={args.sigma} ===", flush=True)
+    n_sweep_plain = []
+    n_sweep_learned = []
+    n_sweep_streaming = []
+
+    def streaming_robust_rls_factory(d_l, weighter_l, dtype_l):
+        from utils.learned_robust import FabricRobustRLS
+        return FabricRobustRLS(d=d_l, weighter=weighter_l, lam=0.99,
+                                R0=torch.eye(d_l, device=device, dtype=dtype_l),
+                                max_iter=args.linear_max_iter,
+                                tol=args.linear_tol,
+                                beta=args.linear_beta,
+                                device=device, training=False, log_every=0)
+
+    for N_l in N_values:
+        mse_plain_acc = 0.0
+        mse_learned_acc = 0.0
+        mse_streaming_acc = 0.0
+        for trial in range(n_trials):
+            w_o_l = make_block_fixed(seed + trial * 1000 + N_l)
+            X, d_obs = make_block(w_o_l, N_l, args.sigma, mode='iid',
+                                  noise=args.noise, p_burst=args.p_burst,
+                                  kappa=args.kappa, seed=seed + trial * 1000 + N_l,
+                                  dtype=dtype, device=device)
+            mse_p, _, _ = block_mse(const_w, X, d_obs, w_o_l, args.block_K, args.block_delta)
+            mse_l, _, _ = block_mse(weighter, X, d_obs, w_o_l, args.block_K, args.block_delta)
+            mse_plain_acc += mse_p
+            mse_learned_acc += mse_l
+
+            # Streaming baseline: run T=N_l RLS samples; take final w.
+            f = streaming_robust_rls_factory(args.d, weighter, dtype)
+            for t in range(N_l):
+                f.step(X[t], d_obs[t])
+            w_stream = f.w
+            mse_s = float(((X @ w_stream - X @ w_o_l).pow(2)).mean().item())
+            mse_streaming_acc += mse_s
+        n_sweep_plain.append(mse_plain_acc / n_trials)
+        n_sweep_learned.append(mse_learned_acc / n_trials)
+        n_sweep_streaming.append(mse_streaming_acc / n_trials)
+        print(f"  N={N_l:4d}: plain={n_sweep_plain[-1]:.4e}  "
+              f"learned={n_sweep_learned[-1]:.4e}  "
+              f"streaming={n_sweep_streaming[-1]:.4e}", flush=True)
+
+    plot_block_mse_vs_N(block_dir, N_values, n_sweep_plain, n_sweep_learned,
+                         n_sweep_streaming)
+
+    # ---- Settle iter histogram ----
+    if k_sweep_iters:
+        plot_block_settle_iter_histogram(block_dir, k_sweep_iters,
+                                          args.block_K, args.block_N)
+
+    # ---- Phase 1.5 gate 5: phantom-vs-exact bias measurement ----
+    print(f"\n=== Phantom-vs-exact implicit gradient bias ===", flush=True)
+    bias_results = _measure_phantom_vs_exact_bias(
+        weighter=weighter, d=args.d, N=args.block_N, K=args.block_K,
+        delta=args.block_delta, sigma=args.sigma, p_burst=args.p_burst,
+        kappa=args.kappa, seed=seed, device=device, dtype=dtype)
+    print(f"  rel_bias={bias_results['rel_bias']:.4e}  "
+          f"phantom_grad={bias_results['phantom_grad']:.4e}  "
+          f"exact_grad={bias_results['exact_grad']:.4e}",
+          flush=True)
+
+    # ---- Save metrics ----
+    metrics = {
+        'd': args.d,
+        'N': args.block_N,
+        'K': args.block_K,
+        'delta': args.block_delta,
+        'noise': args.noise,
+        'p_burst': args.p_burst,
+        'kappa': args.kappa,
+        'sigma': args.sigma,
+        'n_trials': n_trials,
+        'device': str(device),
+        'training': {
+            'epochs': args.block_epochs,
+            'N': args.block_N,
+            'K': args.block_K,
+            'lr': args.block_lr,
+        },
+        'weighter': {
+            'c': float(weighter.c.item()),
+            'alpha': float(weighter.alpha.item()),
+        },
+        'k_sweep': {
+            'K_values': K_values,
+            'plain': k_sweep_plain,
+            'learned': k_sweep_learned,
+            'init': k_sweep_init,
+        },
+        'n_sweep': {
+            'N_values': N_values,
+            'plain': n_sweep_plain,
+            'learned': n_sweep_learned,
+            'streaming': n_sweep_streaming,
+        },
+        'phantom_vs_exact': bias_results,
+    }
+    with open(os.path.join(block_dir, 'block_metrics.json'), 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"\n  [block] Wrote metrics to {block_dir}/block_metrics.json")
+    print(f"  [block] trained weighter: c={metrics['weighter']['c']:.4f}, "
+          f"alpha={metrics['weighter']['alpha']:.4f}")
+    print(f"  Figures in {block_dir}/")
+
+
+def _measure_phantom_vs_exact_bias(weighter, d, N, K, delta, sigma, p_burst,
+                                   kappa, seed, device, dtype):
+    """Measure the phantom-gradient bias at the *trained* weighter's
+    operating point (Phase 1.5 prerequisite #3).
+
+    Training uses ``backward_mode='phantom'`` (cheap VJP per implicit step,
+    Geng et al. 2021) but every existing gate validates only the exact (CG)
+    adjoint.  The gradient actually used for learning is biased by
+    construction; this measures ``rel_bias = |g_phantom - g_exact| /
+    |g_exact|`` on the trained weighter (not the init) and reports it into
+    ``block_metrics.json``.  A measurement, not a pass/fail bound.
+
+    ``weighter`` is the fully-trained weighter; its params are copied into
+    two fresh instances by ``utils.learned_robust.measure_phantom_vs_exact_bias``
+    so the only difference between the phantom and exact runs is the
+    backward mode.
+    """
+    from utils.learned_robust import (
+        block_robust_rls, LearnedRobustWeighter, make_block,
+        measure_phantom_vs_exact_bias,
+    )
+
+    torch.manual_seed(seed)
+    w_o = torch.randn(d, device=device, dtype=dtype)
+    w_o = w_o / w_o.norm()
+    X, d_obs = make_block(w_o, N, sigma, mode='iid',
+                          noise='impulsive', p_burst=p_burst,
+                          kappa=kappa, seed=seed,
+                          dtype=dtype, device=device)
+
+    res = measure_phantom_vs_exact_bias(
+        X, d_obs, w_o, weighter.to(dtype), delta=delta, K=K,
+        max_iter=100, tol=1e-8)
+    res.update({
+        'd': d,
+        'N': N,
+        'K': K,
+        'delta': delta,
+        'sigma': sigma,
+        'p_burst': p_burst,
+        'kappa': kappa,
+        'precision': 'float64 (eval dtype)',
+        'operating_point': 'trained weighter',
+    })
+    return res
 
 
 if __name__ == '__main__':
