@@ -1552,22 +1552,29 @@ def plot_block_mse_vs_K(out_dir, K_values, mse_plain, mse_learned, mse_init):
     plt.close(fig)
 
 
-def plot_block_mse_vs_N(out_dir, N_values, mse_plain, mse_learned, mse_streaming):
-    """Plot MSE-vs-N for the block contenders and the streaming baseline."""
+def plot_block_mse_vs_N(out_dir, N_values, mse_plain, mse_learned,
+                        mse_streaming_plain, mse_streaming_init,
+                        mse_streaming_learned):
+    """Plot MSE-vs-N for the 3x2 contender matrix (block vs streaming
+    by non-robust / fixed-curve-robust / learned-robust)."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.semilogy(N_values, mse_plain, 'o-', color='C1', label='plain batch LS',
-                linewidth=1.5)
-    ax.semilogy(N_values, mse_learned, 's-', color='C3', label='learned block IRLS',
-                linewidth=1.5)
-    ax.semilogy(N_values, mse_streaming, 'v--', color='C5',
-                label='streaming fabric_robust_rls', linewidth=1.5, alpha=0.7)
+    fig, ax = plt.subplots(figsize=(7.5, 4.8))
+    ax.semilogy(N_values, mse_plain, 'o-', color='C1',
+                label='plain batch LS (v=1)', linewidth=1.5)
+    ax.semilogy(N_values, mse_learned, 's-', color='C3',
+                label='learned block IRLS', linewidth=1.5)
+    ax.semilogy(N_values, mse_streaming_plain, 'v--', color='C5',
+                label='streaming EW-RLS (v=1)', linewidth=1.5, alpha=0.7)
+    ax.semilogy(N_values, mse_streaming_init, 'P--', color='C0',
+                label='streaming fixed-curve IR-RLS (init)', linewidth=1.5, alpha=0.7)
+    ax.semilogy(N_values, mse_streaming_learned, 'D--', color='C2',
+                label='streaming learned IR-RLS', linewidth=1.5, alpha=0.7)
     ax.set_xlabel('block size N')
     ax.set_ylabel(r'MSE $= \|X w^K - X w_o\|^2 / N$')
-    ax.set_title('Block robust IRLS: MSE vs N')
-    ax.legend()
+    ax.set_title('Block robust IRLS: MSE vs N (3x2 contender matrix)')
+    ax.legend(fontsize=8)
     ax.grid(True, which='both', alpha=0.3)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, 'robust_block_mse_vs_N.png'), dpi=140)
@@ -1593,18 +1600,27 @@ def plot_block_settle_iter_histogram(out_dir, all_iters, K, N):
 
 
 def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
-    """Phase 1.5 block robust experiment: 4 contenders under impulsive noise.
+    """Phase 1.5 block robust experiment: 6 contenders under impulsive noise.
 
-    Contenders:
-      1. plain batch LS             (the K=0 limit, no weighter)
-      2. learned block IRLS         (frozen weighter, K+1 settles)
-      3. init-only block IRLS       (weighter at init, K+1 settles)
-      4. streaming fabric_robust_rls (T settles, O(d^2) per sample)
+    Contenders (the 3x2 matrix: non-robust / fixed-curve-robust / learned-robust
+    crossed with batch-block / per-sample-streaming):
+
+      1. plain batch LS                  (the K=0 limit, v=1, batch)
+      2. init-only block IRLS            (weighter at init, K+1 settles, batch)
+      3. learned block IRLS              (frozen trained weighter, K+1 settles)
+      4. streaming EW-RLS                (v=1, per-sample, classical RLS baseline)
+      5. streaming fixed-curve IR-RLS    (init weighter, per-sample)
+      6. streaming learned IR-RLS        (trained weighter, per-sample)
 
     Plots:
-      * robust_block_mse_vs_K.png   -- MSE vs K (all three block contenders)
-      * robust_block_mse_vs_N.png   -- MSE vs N (block vs streaming)
-      * robust_block_settle_iters.png -- LinearSolveLayer iter distribution
+      * robust_block_mse_vs_K.png      -- MSE vs K (plain / init / learned block)
+      * robust_block_mse_vs_N.png      -- MSE vs N (all 6 contenders)
+      * robust_block_settle_iters.png  -- LinearSolveLayer iter distribution
+
+    Plus a ``fixed_curve_vs_learned`` summary in ``block_metrics.json``:
+    the best fixed-curve depth (argmin over the init column of the k_sweep)
+    and the learned block at that same K — isolates "better curve" from
+    "more depth."
     """
     # Lazy import (plan decision 9).
     from utils.learned_robust import (
@@ -1653,7 +1669,7 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
     # ---- Generate blocks for the K-sweep and N-sweep ----
     # K-sweep: fix N at args.block_N, sweep K.
     # N-sweep: fix K at args.block_K, sweep N.
-    K_values = [0, 1, 2, 4, 8, 16] if args.block_K_max is None else list(args.block_K_max)
+    K_values = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32] if args.block_K_max is None else list(args.block_K_max)
     N_values = [32, 64, 128, 256, 512] if args.block_N_max is None else list(args.block_N_max)
 
     def make_block_fixed(seed_):
@@ -1720,7 +1736,9 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
           f"noise={args.noise}, sigma={args.sigma} ===", flush=True)
     n_sweep_plain = []
     n_sweep_learned = []
-    n_sweep_streaming = []
+    n_sweep_streaming_plain = []
+    n_sweep_streaming_init = []
+    n_sweep_streaming_learned = []
 
     def streaming_robust_rls_factory(d_l, weighter_l, dtype_l):
         from utils.learned_robust import FabricRobustRLS
@@ -1731,10 +1749,26 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
                                 beta=args.linear_beta,
                                 device=device, training=False, log_every=0)
 
+    def streaming_mse(weighter_l, X, d_obs, w_o_l, N_l):
+        """Run T=N_l weighted-RLS samples with the given weighter; return
+        the MSE of the final w against the same scoring as block_mse.
+
+        ``weighter_l`` may be a constant (v=1) weighter for the plain
+        EW-RLS baseline, the fixed-curve init weighter for the
+        classical robust RLS baseline, or the trained learned weighter.
+        """
+        f = streaming_robust_rls_factory(args.d, weighter_l, dtype)
+        for t in range(N_l):
+            f.step(X[t], d_obs[t])
+        w_stream = f.w
+        return float(((X @ w_stream - X @ w_o_l).pow(2)).mean().item())
+
     for N_l in N_values:
         mse_plain_acc = 0.0
         mse_learned_acc = 0.0
-        mse_streaming_acc = 0.0
+        mse_str_plain_acc = 0.0
+        mse_str_init_acc = 0.0
+        mse_str_learned_acc = 0.0
         for trial in range(n_trials):
             w_o_l = make_block_fixed(seed + trial * 1000 + N_l)
             X, d_obs = make_block(w_o_l, N_l, args.sigma, mode='iid',
@@ -1746,22 +1780,27 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
             mse_plain_acc += mse_p
             mse_learned_acc += mse_l
 
-            # Streaming baseline: run T=N_l RLS samples; take final w.
-            f = streaming_robust_rls_factory(args.d, weighter, dtype)
-            for t in range(N_l):
-                f.step(X[t], d_obs[t])
-            w_stream = f.w
-            mse_s = float(((X @ w_stream - X @ w_o_l).pow(2)).mean().item())
-            mse_streaming_acc += mse_s
+            # Three streaming contenders (3x2 matrix, streaming column):
+            #   streaming_plain  = classical EW-RLS       (v=1)
+            #   streaming_init   = fixed-curve robust RLS (init weighter)
+            #   streaming_learned= learned robust RLS    (trained weighter)
+            mse_str_plain_acc += streaming_mse(const_w, X, d_obs, w_o_l, N_l)
+            mse_str_init_acc += streaming_mse(init_w, X, d_obs, w_o_l, N_l)
+            mse_str_learned_acc += streaming_mse(weighter, X, d_obs, w_o_l, N_l)
         n_sweep_plain.append(mse_plain_acc / n_trials)
         n_sweep_learned.append(mse_learned_acc / n_trials)
-        n_sweep_streaming.append(mse_streaming_acc / n_trials)
+        n_sweep_streaming_plain.append(mse_str_plain_acc / n_trials)
+        n_sweep_streaming_init.append(mse_str_init_acc / n_trials)
+        n_sweep_streaming_learned.append(mse_str_learned_acc / n_trials)
         print(f"  N={N_l:4d}: plain={n_sweep_plain[-1]:.4e}  "
               f"learned={n_sweep_learned[-1]:.4e}  "
-              f"streaming={n_sweep_streaming[-1]:.4e}", flush=True)
+              f"str_plain={n_sweep_streaming_plain[-1]:.4e}  "
+              f"str_init={n_sweep_streaming_init[-1]:.4e}  "
+              f"str_learned={n_sweep_streaming_learned[-1]:.4e}", flush=True)
 
     plot_block_mse_vs_N(block_dir, N_values, n_sweep_plain, n_sweep_learned,
-                         n_sweep_streaming)
+                         n_sweep_streaming_plain, n_sweep_streaming_init,
+                         n_sweep_streaming_learned)
 
     # ---- Settle iter histogram ----
     if k_sweep_iters:
@@ -1778,6 +1817,21 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
           f"phantom_grad={bias_results['phantom_grad']:.4e}  "
           f"exact_grad={bias_results['exact_grad']:.4e}",
           flush=True)
+
+    # ---- Best fixed-curve depth (init weighter) vs learned at the same depth ----
+    # The k_sweep evaluates all three block contenders (plain / init / learned)
+    # on the same K grid and same data per K; the init column's argmin is the
+    # best classical fixed-curve depth. Comparing learned at that same K
+    # isolates "better curve" from "more depth".
+    best_init_idx = min(range(len(K_values)), key=lambda i: k_sweep_init[i])
+    best_init_K = K_values[best_init_idx]
+    best_init_mse = k_sweep_init[best_init_idx]
+    learned_at_best_init_K_mse = k_sweep_learned[best_init_idx]
+    print(f"\n=== Fixed-curve depth profile (k_sweep @ N={args.block_N}) ===",
+          flush=True)
+    print(f"  best fixed-curve (init) K={best_init_K}: "
+          f"init={best_init_mse:.4e}  "
+          f"learned@same K={learned_at_best_init_K_mse:.4e}", flush=True)
 
     # ---- Save metrics ----
     metrics = {
@@ -1811,7 +1865,17 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
             'N_values': N_values,
             'plain': n_sweep_plain,
             'learned': n_sweep_learned,
-            'streaming': n_sweep_streaming,
+            'streaming_plain': n_sweep_streaming_plain,
+            'streaming_init': n_sweep_streaming_init,
+            'streaming_learned': n_sweep_streaming_learned,
+        },
+        'fixed_curve_vs_learned': {
+            'note': ('best fixed-curve depth (min over init column) vs '
+                     'learned block at the same depth; both evaluated '
+                     'on the k_sweep (N=args.block_N).'),
+            'best_init_K': int(best_init_K),
+            'best_init_mse': float(best_init_mse),
+            'learned_at_best_init_K_mse': float(learned_at_best_init_K_mse),
         },
         'phantom_vs_exact': bias_results,
     }

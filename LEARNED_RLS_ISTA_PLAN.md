@@ -577,6 +577,68 @@ init), and `learned < init < plain` at every K>0 (e.g. K=8: 1.70e-5 vs 1.75e-5 v
 the big config) — that is the gate's measurement of the approximation error, now
 decoupled from the training signal.
 
+**Full production run on Kaggle GPU (2026-08-13, d=16, N=512, K=8, 25 epochs,
+10 trials, `cuda:0`).** `block_training_history.json`: monotonic learning across
+all 25 epochs, c 0.1003→**0.0832**, α 0.1281→**0.1541** (vs bit-frozen at init
+pre-fix). `block_metrics.json`: `learned < init < plain` at **every** K (K=8:
+1.24e-5 vs 1.44e-5 vs 2.19e-5, −43% vs plain) and `learned < plain < streaming`
+at every N (N=512: 1.77e-5 vs 3.35e-5, −47% vs plain; streaming 5.36e-5). The
+trained influence curve is narrower/steeper (c↓, α↑) — stronger downweighting of
+moderate/large residuals, the expected robust behavior. Note the `streaming`
+column uses the *block-trained* weighter in streaming inference mode
+(`FabricRobustRLS`, per-sample, 1 settle/sample) — it measures processing mode,
+not a streaming-trained curve. Results: `real_gradient_robust_block_ir_rls_results`.
+
+### Completed 3×2 contender matrix (2026-08-13)
+
+The block experiment now reports the full 3×2 matrix of contenders:
+non-robust / fixed-curve-robust / learned-robust crossed with batch-block /
+per-sample-streaming. Implementation: `run_robust_block_experiment` in
+`src/run_rls_demo.py:1595`. No new algorithms — `FabricRobustRLS` with the
+already-constructed `const_w` / `init_w` / `weighter` (lines 1649–1651) gives
+classical EW-RLS, fixed-curve robust RLS, and learned robust RLS respectively.
+The k_sweep grid is densified to `K_values = [0,1,2,3,4,6,8,12,16,24,32]` for
+the fixed-curve depth profile; `block_metrics.json` adds `streaming_plain` and
+`streaming_init` to the n_sweep and a `fixed_curve_vs_learned` summary
+(best fixed-curve K + its MSE vs learned at the same K).
+
+**Contenders (6).** batch{plain batch LS, init block IRLS, learned block IRLS}
+× streaming{streaming EW-RLS, streaming fixed-curve IR-RLS, streaming learned
+IR-RLS}.
+
+**Fast verify on `ssr0` (2026-08-13, d=16, N=128, K=4, 3 epochs, 3 trials,
+impulsive noise, `out_dir=/tmp/rls_baselines_verify`).** n_sweep (block at
+K=4, N swept):
+
+| N | plain | learned | str_plain | str_init | str_learned |
+|---|---|---|---|---|---|
+| 32 | 1.23e-4 | 1.22e-4 | 9.62e-4 | 2.01e-3 | 2.06e-3 |
+| 64 | 2.41e-4 | 1.90e-4 | 3.46e-4 | 3.45e-4 | 3.46e-4 |
+| 128 | 7.96e-5 | 6.47e-5 | 1.02e-4 | 9.17e-5 | 9.13e-5 |
+| 256 | 4.54e-5 | 2.75e-5 | 6.72e-5 | 4.73e-5 | 4.65e-5 |
+| 512 | 2.41e-5 | **1.66e-5** | 5.02e-5 | 3.38e-5 | **3.32e-5** |
+
+Observations (the scientific answers the matrix unlocks):
+1. **`learned` (block) < `streaming_learned` (per-sample)** at every N — block
+   parallel settles beat per-sample recursion given the *same* trained curve
+   (e.g. N=512: 1.66e-5 vs 3.32e-5, ~2× better).
+2. **`str_init` ≈ `str_learned`** — the fixed hand-set curve is essentially as
+   good as the trained curve in streaming mode (N=512: 3.38e-5 vs 3.32e-5).
+   **The learned curve's value lies in the block-parallel settles, not in
+   streaming inference.** This is the key new finding enabled by the matrix.
+3. **`str_plain` (EW-RLS) ≥ robust streaming at large N** — robustness
+   (fixed-curve or learned) beats classical EW-RLS once N is large enough for
+   the estimator to converge; at N=32 the per-sample weighter misfires on
+   small samples (expected, see lambda=0.99 convergence).
+4. **`fixed_curve_vs_learned` summary**: best fixed-curve depth = K=2
+   (init @ K=2: 2.83e-5); learned @ K=2: 2.82e-5. With 3 training epochs the
+   learned curve barely moves (c 0.10→0.099, α 0.128→0.13); the 25-epoch
+   Kaggle run (above) shows the learned curve moves further and beats init
+   more cleanly. Production-scale, not fast-verify, is the authoritative
+   comparison for the "better curve" claim.
+
+All 18 gates (`tests/test_learned_robust.py`) + `tests/run_all.py` green.
+
 ## Phase 2 — Learned-Prox ISTA (equalizer framing)
 
 New **`src/utils/learned_ista.py`**:
