@@ -1552,7 +1552,8 @@ def plot_block_mse_vs_K(out_dir, K_values, mse_plain, mse_learned, mse_init):
     plt.close(fig)
 
 
-def plot_block_mse_vs_N(out_dir, N_values, mse_plain, mse_learned,
+def plot_block_mse_vs_N(out_dir, N_values,
+                        mse_plain, mse_init, mse_learned,
                         mse_streaming_plain, mse_streaming_init,
                         mse_streaming_learned):
     """Plot MSE-vs-N for the 3x2 contender matrix (block vs streaming
@@ -1560,14 +1561,16 @@ def plot_block_mse_vs_N(out_dir, N_values, mse_plain, mse_learned,
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(7.5, 4.8))
+    fig, ax = plt.subplots(figsize=(8, 5))
     ax.semilogy(N_values, mse_plain, 'o-', color='C1',
                 label='plain batch LS (v=1)', linewidth=1.5)
+    ax.semilogy(N_values, mse_init, '^--', color='C0',
+                label='init block IRLS (fixed curve)', linewidth=1.5, alpha=0.7)
     ax.semilogy(N_values, mse_learned, 's-', color='C3',
                 label='learned block IRLS', linewidth=1.5)
     ax.semilogy(N_values, mse_streaming_plain, 'v--', color='C5',
                 label='streaming EW-RLS (v=1)', linewidth=1.5, alpha=0.7)
-    ax.semilogy(N_values, mse_streaming_init, 'P--', color='C0',
+    ax.semilogy(N_values, mse_streaming_init, 'P--', color='C4',
                 label='streaming fixed-curve IR-RLS (init)', linewidth=1.5, alpha=0.7)
     ax.semilogy(N_values, mse_streaming_learned, 'D--', color='C2',
                 label='streaming learned IR-RLS', linewidth=1.5, alpha=0.7)
@@ -1616,6 +1619,11 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
       * robust_block_mse_vs_K.png      -- MSE vs K (plain / init / learned block)
       * robust_block_mse_vs_N.png      -- MSE vs N (all 6 contenders)
       * robust_block_settle_iters.png  -- LinearSolveLayer iter distribution
+
+    The k_sweep holds each trial's block fixed across all K values (seed
+    depends on trial only, not K) so the plain column (v=1, K-independent)
+    serves as a self-check: it should be ~flat.  The n_sweep varies the
+    block per N (seed includes + N_l) because N is the real axis there.
 
     Plus a ``fixed_curve_vs_learned`` summary in ``block_metrics.json``:
     the best fixed-curve depth (argmin over the init column of the k_sweep)
@@ -1709,10 +1717,14 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
         mse_learned_acc = 0.0
         mse_init_acc = 0.0
         for trial in range(n_trials):
-            w_o_l = make_block_fixed(seed + trial * 1000 + K_l)
+            # Hold the block fixed across all K values within a trial
+            # (seed depends on trial only, not K) so the K-sweep isolates
+            # the depth effect from per-K data noise.  The 'plain' column
+            # (v=1, K-independent) is the self-check: it should be ~flat.
+            w_o_l = make_block_fixed(seed + trial * 1000)
             X, d_obs = make_block(w_o_l, args.block_N, args.sigma, mode='iid',
                                   noise=args.noise, p_burst=args.p_burst,
-                                  kappa=args.kappa, seed=seed + trial * 1000 + K_l,
+                                  kappa=args.kappa, seed=seed + trial * 1000,
                                   dtype=dtype, device=device)
             mse_p, _, _ = block_mse(const_w, X, d_obs, w_o_l, K_l, args.block_delta)
             mse_l, it_l, _ = block_mse(weighter, X, d_obs, w_o_l, K_l, args.block_delta)
@@ -1735,6 +1747,7 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
     print(f"\n=== Block robust: N-sweep, K={args.block_K}, "
           f"noise={args.noise}, sigma={args.sigma} ===", flush=True)
     n_sweep_plain = []
+    n_sweep_init = []
     n_sweep_learned = []
     n_sweep_streaming_plain = []
     n_sweep_streaming_init = []
@@ -1765,6 +1778,7 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
 
     for N_l in N_values:
         mse_plain_acc = 0.0
+        mse_init_acc = 0.0
         mse_learned_acc = 0.0
         mse_str_plain_acc = 0.0
         mse_str_init_acc = 0.0
@@ -1776,8 +1790,10 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
                                   kappa=args.kappa, seed=seed + trial * 1000 + N_l,
                                   dtype=dtype, device=device)
             mse_p, _, _ = block_mse(const_w, X, d_obs, w_o_l, args.block_K, args.block_delta)
+            mse_i, _, _ = block_mse(init_w, X, d_obs, w_o_l, args.block_K, args.block_delta)
             mse_l, _, _ = block_mse(weighter, X, d_obs, w_o_l, args.block_K, args.block_delta)
             mse_plain_acc += mse_p
+            mse_init_acc += mse_i
             mse_learned_acc += mse_l
 
             # Three streaming contenders (3x2 matrix, streaming column):
@@ -1788,17 +1804,20 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
             mse_str_init_acc += streaming_mse(init_w, X, d_obs, w_o_l, N_l)
             mse_str_learned_acc += streaming_mse(weighter, X, d_obs, w_o_l, N_l)
         n_sweep_plain.append(mse_plain_acc / n_trials)
+        n_sweep_init.append(mse_init_acc / n_trials)
         n_sweep_learned.append(mse_learned_acc / n_trials)
         n_sweep_streaming_plain.append(mse_str_plain_acc / n_trials)
         n_sweep_streaming_init.append(mse_str_init_acc / n_trials)
         n_sweep_streaming_learned.append(mse_str_learned_acc / n_trials)
         print(f"  N={N_l:4d}: plain={n_sweep_plain[-1]:.4e}  "
+              f"init={n_sweep_init[-1]:.4e}  "
               f"learned={n_sweep_learned[-1]:.4e}  "
               f"str_plain={n_sweep_streaming_plain[-1]:.4e}  "
               f"str_init={n_sweep_streaming_init[-1]:.4e}  "
               f"str_learned={n_sweep_streaming_learned[-1]:.4e}", flush=True)
 
-    plot_block_mse_vs_N(block_dir, N_values, n_sweep_plain, n_sweep_learned,
+    plot_block_mse_vs_N(block_dir, N_values,
+                         n_sweep_plain, n_sweep_init, n_sweep_learned,
                          n_sweep_streaming_plain, n_sweep_streaming_init,
                          n_sweep_streaming_learned)
 
@@ -1864,10 +1883,15 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
         'n_sweep': {
             'N_values': N_values,
             'plain': n_sweep_plain,
+            'init': n_sweep_init,
             'learned': n_sweep_learned,
             'streaming_plain': n_sweep_streaming_plain,
             'streaming_init': n_sweep_streaming_init,
             'streaming_learned': n_sweep_streaming_learned,
+            # Back-compat alias: pre-fix the learned-streaming curve was
+            # written under the key 'streaming'.  Keep it so downstream
+            # readers of the old key continue to work.
+            'streaming': n_sweep_streaming_learned,
         },
         'fixed_curve_vs_learned': {
             'note': ('best fixed-curve depth (min over init column) vs '
@@ -1892,12 +1916,13 @@ def _measure_phantom_vs_exact_bias(weighter, d, N, K, delta, sigma, p_burst,
     """Measure the phantom-gradient bias at the *trained* weighter's
     operating point (Phase 1.5 prerequisite #3).
 
-    Training uses ``backward_mode='phantom'`` (cheap VJP per implicit step,
-    Geng et al. 2021) but every existing gate validates only the exact (CG)
-    adjoint.  The gradient actually used for learning is biased by
-    construction; this measures ``rel_bias = |g_phantom - g_exact| /
-    |g_exact|`` on the trained weighter (not the init) and reports it into
-    ``block_metrics.json``.  A measurement, not a pass/fail bound.
+    Note: since the 2026-08-13 fix, training defaults to
+    ``backward_mode='exact'`` (the true implicit gradient) — the phantom
+    gradient is no longer the one used for learning.  This measurement
+    is still reported for diagnostic purposes: it quantifies the
+    approximation error of the phantom (Geng et al. 2021) VJP at the
+    trained weighter's operating point, decoupled from the training
+    signal.  A measurement, not a pass/fail bound.
 
     ``weighter`` is the fully-trained weighter; its params are copied into
     two fresh instances by ``utils.learned_robust.measure_phantom_vs_exact_bias``

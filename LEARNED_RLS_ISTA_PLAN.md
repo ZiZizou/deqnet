@@ -597,9 +597,13 @@ per-sample-streaming. Implementation: `run_robust_block_experiment` in
 `src/run_rls_demo.py:1595`. No new algorithms — `FabricRobustRLS` with the
 already-constructed `const_w` / `init_w` / `weighter` (lines 1649–1651) gives
 classical EW-RLS, fixed-curve robust RLS, and learned robust RLS respectively.
-The k_sweep grid is densified to `K_values = [0,1,2,3,4,6,8,12,16,24,32]` for
-the fixed-curve depth profile; `block_metrics.json` adds `streaming_plain` and
-`streaming_init` to the n_sweep and a `fixed_curve_vs_learned` summary
+The k_sweep grid is densified to `K_values = [0,1,2,3,4,6,8,12,16,24,32]` and
+the k_sweep now **holds each trial's block fixed across all K** (seed
+`seed + trial*1000`, no `+ K_l`) so the `plain` column (v=1, K-independent)
+serves as a self-check that the sweep isolates the depth effect. `block_metrics.json`
+adds `streaming_plain` and `streaming_init` to the n_sweep, a new
+`init` block column in the n_sweep (completing the 3×2), a back-compat alias
+`streaming = streaming_learned`, and a `fixed_curve_vs_learned` summary
 (best fixed-curve K + its MSE vs learned at the same K).
 
 **Contenders (6).** batch{plain batch LS, init block IRLS, learned block IRLS}
@@ -607,21 +611,29 @@ the fixed-curve depth profile; `block_metrics.json` adds `streaming_plain` and
 IR-RLS}.
 
 **Fast verify on `ssr0` (2026-08-13, d=16, N=128, K=4, 3 epochs, 3 trials,
-impulsive noise, `out_dir=/tmp/rls_baselines_verify`).** n_sweep (block at
-K=4, N swept):
+impulsive noise, clean k_sweep — same block per trial across all K).**
 
-| N | plain | learned | str_plain | str_init | str_learned |
-|---|---|---|---|---|---|
-| 32 | 1.23e-4 | 1.22e-4 | 9.62e-4 | 2.01e-3 | 2.06e-3 |
-| 64 | 2.41e-4 | 1.90e-4 | 3.46e-4 | 3.45e-4 | 3.46e-4 |
-| 128 | 7.96e-5 | 6.47e-5 | 1.02e-4 | 9.17e-5 | 9.13e-5 |
-| 256 | 4.54e-5 | 2.75e-5 | 6.72e-5 | 4.73e-5 | 4.65e-5 |
-| 512 | 2.41e-5 | **1.66e-5** | 5.02e-5 | 3.38e-5 | **3.32e-5** |
+K-sweep self-check: `plain` is **flat at 1.5211e-4 across all K** (v=1 ⇒
+K-independent), confirming the sweep isolates depth from data noise. Both
+`init` and `learned` plateau by K=3 (init 9.77e-5, learned 9.59e-5), and
+stay flat through K=32. `fixed_curve_vs_learned`: best fixed-curve K=32
+(argmin over the now-trustworthy init column) → init 9.77e-5, learned@K=32
+9.59e-5 (learned < init by ~2%, consistent across the flat tail).
+
+N-sweep (block at K=4, N swept):
+
+| N | plain | init | learned | str_plain | str_init | str_learned |
+|---|---|---|---|---|---|---|
+| 32 | 1.23e-4 | 1.22e-4 | 1.22e-4 | 9.62e-4 | 2.01e-3 | 2.06e-3 |
+| 64 | 2.41e-4 | 1.92e-4 | 1.90e-4 | 3.46e-4 | 3.45e-4 | 3.46e-4 |
+| 128 | 7.96e-5 | 6.53e-5 | 6.47e-5 | 1.02e-4 | 9.17e-5 | 9.13e-5 |
+| 256 | 4.54e-5 | 2.80e-5 | 2.75e-5 | 6.72e-5 | 4.73e-5 | 4.65e-5 |
+| 512 | 2.41e-5 | 1.69e-5 | **1.66e-5** | 5.02e-5 | 3.38e-5 | **3.32e-5** |
 
 Observations (the scientific answers the matrix unlocks):
 1. **`learned` (block) < `streaming_learned` (per-sample)** at every N — block
    parallel settles beat per-sample recursion given the *same* trained curve
-   (e.g. N=512: 1.66e-5 vs 3.32e-5, ~2× better).
+   (N=512: 1.66e-5 vs 3.32e-5, ~2× better).
 2. **`str_init` ≈ `str_learned`** — the fixed hand-set curve is essentially as
    good as the trained curve in streaming mode (N=512: 3.38e-5 vs 3.32e-5).
    **The learned curve's value lies in the block-parallel settles, not in
@@ -630,12 +642,19 @@ Observations (the scientific answers the matrix unlocks):
    (fixed-curve or learned) beats classical EW-RLS once N is large enough for
    the estimator to converge; at N=32 the per-sample weighter misfires on
    small samples (expected, see lambda=0.99 convergence).
-4. **`fixed_curve_vs_learned` summary**: best fixed-curve depth = K=2
-   (init @ K=2: 2.83e-5); learned @ K=2: 2.82e-5. With 3 training epochs the
-   learned curve barely moves (c 0.10→0.099, α 0.128→0.13); the 25-epoch
-   Kaggle run (above) shows the learned curve moves further and beats init
-   more cleanly. Production-scale, not fast-verify, is the authoritative
-   comparison for the "better curve" claim.
+4. **Block `init` < block `learned` < `plain`** at every N ≥ 128, mirroring
+   the K-sweep ordering. With 3 training epochs the learned curve barely
+   moves (c 0.10→0.099, α 0.128→0.13); the 25-epoch Kaggle run (above) shows
+   the learned curve moves further and the init-vs-learned gap widens.
+   Production-scale, not fast-verify, is the authoritative comparison for
+   the "better curve" claim.
+
+**Note on the Kaggle production k_sweep.** The earlier 25-epoch Kaggle GPU
+run (`real_gradient_robust_block_ir_rls_results`) used the *pre-F1* k_sweep
+seed pattern (`+ K_l`), so its k_sweep per-K ordering (`learned < init <
+plain` at every K) remains valid (same block per K) but its absolute MSE
+values and any argmin over K are confounded by per-K data noise. The
+per-block comparisons and the N-sweep at that scale are unaffected.
 
 All 18 gates (`tests/test_learned_robust.py`) + `tests/run_all.py` green.
 
