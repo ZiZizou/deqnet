@@ -254,6 +254,7 @@ from utils.learned_robust import (
     constant_weighter,
     block_robust_rls, digital_block_robust_rls, make_block,
     measure_phantom_vs_exact_bias, oracle_weighter,
+    FixedCauchyWeighter, MADRobustWeighter,
 )
 from run_rls_demo import (
     DigitalRLS, FabricRLS, _make_noise, make_stream,
@@ -1099,6 +1100,134 @@ def test_oos_monotonicity(d=6, delta=1e-2, K=4, sigma=0.01, p_burst=0.02,
             f"OOS oracle should be <= learned: oracle={oo:.4e}, learned={ll:.4e}"
 
 
+def test_mad_scale_tracks_noise(T=2000, seed=0):
+    """Classical-robust baseline gate 1: the MAD-adaptive scale.
+
+    (a) 1.4826 * median(|e|) recovers the noise scale for Gaussian blocks.
+    (b) The scale is recomputed PER CALL (no cross-call caching): the same
+        ``MADRobustWeighter`` module given residual blocks of different
+        scales weights the *same* residual value differently -- downweights
+        it when it is many sigma (small-scale block) and keeps it when it
+        is sub-sigma (large-scale block).
+    """
+    torch.manual_seed(seed)
+    e1 = 0.005 * torch.randn(T, dtype=torch.float64)
+    e2 = 0.05 * torch.randn(T, dtype=torch.float64)
+    # Inject the same absolute residual into both blocks.
+    e1[0] = 0.02
+    e2[0] = 0.02
+
+    # (a) MAD scale ~ sigma for Gaussian noise.
+    s1 = 1.4826 * e1.abs().median()
+    s2 = 1.4826 * e2.abs().median()
+    assert 0.8 < s1 / 0.005 < 1.2, \
+        f"MAD scale mismatch (small): {s1:.4e} vs 0.005"
+    assert 0.8 < s2 / 0.05 < 1.2, \
+        f"MAD scale mismatch (large): {s2:.4e} vs 0.05"
+
+    # (b) Per-block adaptivity: 0.02 is 4 sigma of e1 (downweight) but
+    # 0.4 sigma of e2 (keep).  A cached scale would fail this.
+    w = MADRobustWeighter(mode='huber', dtype=torch.float64)
+    v1 = w(e1)
+    v2 = w(e2)
+    print(f"  [mad scale] s1={s1:.4e} s2={s2:.4e} "
+          f"v1[0]={v1[0].item():.4f} v2[0]={v2[0].item():.4f}")
+    assert v1[0].item() < 0.5, \
+        f"small-scale block must downweight 0.02 (4 sigma): v1[0]={v1[0].item():.4f}"
+    assert v2[0].item() > 0.9, \
+        f"large-scale block must keep 0.02 (0.4 sigma): v2[0]={v2[0].item():.4f}"
+    assert not torch.equal(v1, v2), \
+        "MAD weighter must not cache its scale across calls"
+
+    # Hampel: a far outlier (|u| > r) must be fully zeroed.
+    e3 = 0.01 * torch.randn(T, dtype=torch.float64)
+    e3[0] = 100.0 * 0.01  # 100 sigma
+    w_hm = MADRobustWeighter(mode='hampel', dtype=torch.float64)
+    v3 = w_hm(e3)
+    assert v3[0].item() < 1e-6, \
+        f"Hampel should zero a 100-sigma outlier: v3[0]={v3[0].item():.4e}"
+
+
+def test_huber_hampel_mad_improvement(d=6, N=256, delta=1e-2, K=8,
+                                      sigma=0.01, p_burst=0.02, kappa=20.0,
+                                      seed=0, n_trials=3):
+    """Classical-robust baseline gate 2: Huber/Hampel + MAD beat plain on
+    impulsive blocks, and degrade only mildly on clean (Gaussian) blocks.
+
+    The MAD-adaptive scale (1.4826 * median|e|, recomputed per IRLS round)
+    is the classical state-of-the-art fixed robust method.  If the learned
+    weighter cannot beat these, the paper story needs the richer weighter
+    (per the "missing contender" audit).
+
+    The Gaussian-case bound is deliberately NOT ~0: on clean data a robust
+    estimator sacrifices efficiency (Huber at a=1.345 is ~95% asymptotically
+    relative efficiency with known scale; finite-sample scale estimation
+    and the in-sample metric -- which rewards LS by construction -- inflate
+    that further).  The gate asserts only that the degradation is bounded
+    (no catastrophic/spurious downweighting).
+    """
+    huber_w = MADRobustWeighter(mode='huber', dtype=torch.float64)
+    hampel_w = MADRobustWeighter(mode='hampel', dtype=torch.float64)
+    const_w = constant_weighter(1.0, dtype=torch.float64)
+
+    def _mse_block(X, d_obs, wgt):
+        w = block_robust_rls(X, d_obs, wgt, delta=delta, K=K,
+                             max_iter=200, tol=1e-10, beta=1.0,
+                             backward_mode='exact')
+        return w
+
+    # ---- Impulsive: MAD-adaptive robust must beat plain ----
+    imp = {'plain': 0.0, 'huber': 0.0, 'hampel': 0.0}
+    for trial in range(n_trials):
+        g = torch.Generator().manual_seed(seed + 1000 + trial)
+        w_o = torch.randn(d, generator=g, dtype=torch.float64)
+        w_o = w_o / w_o.norm()
+        X, d_obs = make_block(w_o, N, sigma, mode='iid', noise='impulsive',
+                              p_burst=p_burst, kappa=kappa,
+                              seed=seed + 1000 + trial,
+                              dtype=torch.float64)
+        mse = lambda w_: float(((X @ w_ - X @ w_o).pow(2)).mean().item())
+        imp['plain'] += mse(_mse_block(X, d_obs, const_w))
+        imp['huber'] += mse(_mse_block(X, d_obs, huber_w))
+        imp['hampel'] += mse(_mse_block(X, d_obs, hampel_w))
+    for k in imp:
+        imp[k] /= n_trials
+    print(f"  [huber/hampel impulsive] plain={imp['plain']:.4e} "
+          f"huber={imp['huber']:.4e} hampel={imp['hampel']:.4e}")
+    assert imp['huber'] < imp['plain'], \
+        f"Huber+MAD must beat plain on impulsive: {imp['huber']:.4e} vs {imp['plain']:.4e}"
+    assert imp['hampel'] < imp['plain'], \
+        f"Hampel+MAD must beat plain on impulsive: {imp['hampel']:.4e} vs {imp['plain']:.4e}"
+
+    # ---- Gaussian (clean): MAD-adaptive degrades only mildly ----
+    gauss = {'plain': 0.0, 'huber': 0.0, 'hampel': 0.0}
+    for trial in range(n_trials):
+        g = torch.Generator().manual_seed(seed + 2000 + trial)
+        w_o = torch.randn(d, generator=g, dtype=torch.float64)
+        w_o = w_o / w_o.norm()
+        X, d_obs = make_block(w_o, N, sigma, mode='iid', noise='gaussian',
+                              seed=seed + 2000 + trial,
+                              dtype=torch.float64)
+        mse = lambda w_: float(((X @ w_ - X @ w_o).pow(2)).mean().item())
+        gauss['plain'] += mse(_mse_block(X, d_obs, const_w))
+        gauss['huber'] += mse(_mse_block(X, d_obs, huber_w))
+        gauss['hampel'] += mse(_mse_block(X, d_obs, hampel_w))
+    for k in gauss:
+        gauss[k] /= n_trials
+    rel_huber = abs(gauss['huber'] - gauss['plain']) / max(gauss['plain'], 1e-30)
+    rel_hampel = abs(gauss['hampel'] - gauss['plain']) / max(gauss['plain'], 1e-30)
+    print(f"  [huber/hampel gaussian] plain={gauss['plain']:.4e} "
+          f"huber={gauss['huber']:.4e} hampel={gauss['hampel']:.4e}")
+    # Bounded efficiency loss only: at a=1.345, Huber is ~95% ARE (asymptotic,
+    # known scale); finite-sample MAD estimation plus the in-sample metric
+    # (which rewards LS by construction) inflate that further.  The gate
+    # rejects only catastrophic/spurious downweighting (order-1x degradation).
+    assert rel_huber < 2.5e-1, \
+        f"Huber must not catastrophically degrade on Gaussian: rel={rel_huber:.4e}"
+    assert rel_hampel < 2.5e-1, \
+        f"Hampel must not catastrophically degrade on Gaussian: rel={rel_hampel:.4e}"
+
+
 if __name__ == '__main__':
     print("=" * 60)
     print("Phase 0 + Phase 1 + Phase 1.5 + oracle-oos gates")
@@ -1127,4 +1256,7 @@ if __name__ == '__main__':
     # Phase 0 (oracle-oos-headroom)
     test_oracle_bound()
     test_oos_monotonicity()
+    # Classical-robust baselines (Huber/Hampel + MAD scale)
+    test_mad_scale_tracks_noise()
+    test_huber_hampel_mad_improvement()
     print("\nAll Phase 0 + Phase 1 + Phase 1.5 + oracle-oos gates passed.")

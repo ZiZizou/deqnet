@@ -794,6 +794,10 @@ def run_experiment(args):
         run_batch_experiment(args, out_dir, w_o, device, dtype, args.seed)
         return
 
+    if args.grid_sweep:
+        run_grid_sweep(args, out_dir, w_o, device, dtype, args.seed)
+        return
+
     if args.train_robust_block:
         run_robust_block_experiment(args, out_dir, w_o, device, dtype, args.seed)
         return
@@ -1437,6 +1441,28 @@ def parse_args():
                         help="K values for the K-sweep (default 0 1 2 4 8 16).")
     parser.add_argument('--block_N_max', type=int, nargs='+', default=None,
                         help="N values for the N-sweep (default 32 64 128 256 512).")
+    # ---- Grid sweep: (c, alpha) family-vs-training decomposition ----
+    parser.add_argument('--grid_sweep', action='store_true',
+                        help="Run the (c, alpha) fixed-curve grid sweep at the "
+                             "block config: dense log-grid over the Cauchy curve "
+                             "parameters, compared against plain / trained / "
+                             "oracle on the SAME blocks (k_sweep fixed-block "
+                             "protocol).  Verdict: TRAINING (grid-best ~ oracle) "
+                             "vs FAMILY (grid-best >> oracle).")
+    parser.add_argument('--grid_c_lo', type=float, default=0.01,
+                        help="Low c for the (c, alpha) grid (log-spaced; "
+                             "default 0.01, below the burst scale kappa*sigma).")
+    parser.add_argument('--grid_c_hi', type=float, default=1.0,
+                        help="High c for the grid (default 1.0).")
+    parser.add_argument('--grid_n_c', type=int, default=20,
+                        help="Number of c values in the dense grid (default 20).")
+    parser.add_argument('--grid_alpha_lo', type=float, default=0.05,
+                        help="Low alpha for the grid (log-spaced; default 0.05).")
+    parser.add_argument('--grid_alpha_hi', type=float, default=5.0,
+                        help="High alpha for the grid (default 5.0).")
+    parser.add_argument('--grid_n_alpha', type=int, default=20,
+                        help="Number of alpha values in the dense grid "
+                             "(default 20).")
     return parser.parse_args()
 
 
@@ -1548,11 +1574,13 @@ def train_robust_weighter_block(d, *, N=512, K=8, delta=1e-2, epochs=80,
 
 
 def plot_block_mse_vs_K(out_dir, K_values, mse_plain, mse_learned, mse_init,
-                        mse_oracle=None):
+                        mse_oracle=None, mse_huber=None, mse_hampel=None):
     """Plot MSE-vs-K for the block contenders (one curve per contender).
 
     Phase 0 (oracle-oos-headroom): ``mse_oracle`` adds the 4th (oracle)
     curve -- the idealized true-burst-mask ceiling for any curve.
+    Classical robust baselines: ``mse_huber`` / ``mse_hampel`` add the
+    MAD-adaptive curves.
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -1568,6 +1596,12 @@ def plot_block_mse_vs_K(out_dir, K_values, mse_plain, mse_learned, mse_init,
         ax.semilogy(K_values, mse_oracle, 'd-', color='C6',
                     label='oracle block IRLS (true burst mask)',
                     linewidth=1.5)
+    if mse_huber is not None:
+        ax.semilogy(K_values, mse_huber, 'x-', color='C2',
+                    label='Huber + MAD (per-block scale)', linewidth=1.5)
+    if mse_hampel is not None:
+        ax.semilogy(K_values, mse_hampel, '*--', color='C4',
+                    label='Hampel + MAD (per-block scale)', linewidth=1.5)
     ax.set_xlabel('K (outer IRLS iterations)')
     ax.set_ylabel(r'MSE $= \|X w^K - X w_o\|^2 / N$')
     ax.set_title('Block robust IRLS: MSE vs K (oracle ceiling)')
@@ -1582,15 +1616,19 @@ def plot_block_mse_vs_N(out_dir, N_values,
                         mse_plain, mse_init, mse_learned,
                         mse_streaming_plain, mse_streaming_init,
                         mse_streaming_learned,
-                        mse_oracle=None, oos=None):
+                        mse_oracle=None, mse_huber=None, mse_hampel=None,
+                        oos=None):
     """Plot MSE-vs-N for the 3x2 contender matrix (block vs streaming
     by non-robust / fixed-curve-robust / learned-robust).
 
     Phase 0 (oracle-oos-headroom) extensions:
       * ``mse_oracle`` adds the oracle batch curve to the in-sample panel.
-      * ``oos`` (dict with 'plain'/'init'/'learned'/'oracle' lists) adds
-        a second, out-of-sample panel: fit on a train block, score on a
-        fresh test block.  All keys optional; absent curves are skipped.
+      * ``mse_huber`` / ``mse_hampel`` add the classical MAD-adaptive
+        batch curves to the in-sample panel.
+      * ``oos`` (dict with 'plain'/'init'/'learned'/'oracle'/'huber'/
+        'hampel' lists) adds a second, out-of-sample panel: fit on a train
+        block, score on a fresh test block.  All keys optional; absent
+        curves are skipped.
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -1610,6 +1648,12 @@ def plot_block_mse_vs_N(out_dir, N_values,
     if mse_oracle is not None:
         ax.semilogy(N_values, mse_oracle, 'd-', color='C6',
                     label='oracle block IRLS (true burst mask)', linewidth=1.5)
+    if mse_huber is not None:
+        ax.semilogy(N_values, mse_huber, 'x-', color='C2',
+                    label='Huber + MAD (per-block scale)', linewidth=1.5)
+    if mse_hampel is not None:
+        ax.semilogy(N_values, mse_hampel, '*--', color='C4',
+                    label='Hampel + MAD (per-block scale)', linewidth=1.5)
     ax.semilogy(N_values, mse_streaming_plain, 'v--', color='C5',
                 label='streaming EW-RLS (v=1)', linewidth=1.5, alpha=0.7)
     ax.semilogy(N_values, mse_streaming_init, 'P--', color='C4',
@@ -1632,6 +1676,8 @@ def plot_block_mse_vs_N(out_dir, N_values,
         _plot_oos('init', '^--', 'C0', 'init block IRLS (fixed curve)')
         _plot_oos('learned', 's-', 'C3', 'learned block IRLS')
         _plot_oos('oracle', 'd-', 'C6', 'oracle block IRLS (true burst mask)')
+        _plot_oos('huber', 'x-', 'C2', 'Huber + MAD')
+        _plot_oos('hampel', '*--', 'C4', 'Hampel + MAD')
         ax2.set_xlabel('block size N')
         ax2.set_ylabel(r'OOS MSE $= \|X_{test} w - X_{test} w_o\|^2 / N$')
         ax2.set_title('Out-of-sample (fit on train block, score on a fresh block)')
@@ -1661,6 +1707,232 @@ def plot_block_settle_iter_histogram(out_dir, all_iters, K, N):
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, 'robust_block_settle_iters.png'), dpi=140)
     plt.close(fig)
+
+
+def _load_or_train_block_weighter(args, out_dir, device, dtype, seed):
+    """Shared train-or-load for the block robust weighter.
+
+    Used by both ``run_robust_block_experiment`` and ``run_grid_sweep`` so
+    the trained curve is a single source of truth across the two
+    diagnostics.
+
+    Returns ``(weighter_train, history, block_dir)``.  ``weighter_train``
+    is the float32 training-state weighter in eval mode (NOT yet cast to
+    the eval dtype -- callers cast with ``.to(device).to(dtype)`` as
+    needed, decision 10).
+    """
+    from utils.learned_robust import LearnedRobustWeighter
+
+    block_dir = os.path.join(out_dir, 'robust_block')
+    _ensure_dir(block_dir)
+    weighter_train = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    if args.block_weighter_path and os.path.exists(args.block_weighter_path):
+        sd = torch.load(args.block_weighter_path, map_location='cpu')
+        weighter_train.load_state_dict(sd)
+        print(f"  [block] loaded trained weighter from {args.block_weighter_path}")
+        history = []
+    else:
+        print(f"  [block] training weighter: epochs={args.block_epochs},"
+              f" N={args.block_N}, K={args.block_K}, delta={args.block_delta},"
+              f" sigma={args.sigma}, p_burst={args.p_burst},"
+              f" kappa={args.kappa}, lr={args.block_lr},"
+              f" backward={args.block_backward_mode}")
+        weighter_train, history = train_robust_weighter_block(
+            d=args.d, N=args.block_N, K=args.block_K, delta=args.block_delta,
+            epochs=args.block_epochs, sigma=args.sigma, p_burst=args.p_burst,
+            kappa=args.kappa, device=device, lr=args.block_lr,
+            seed=seed, log_every=max(1, args.block_epochs // 8),
+            return_history=True, backward_mode=args.block_backward_mode)
+        # Trainer solver defaults (max_iter=50, tol=1e-5) are the documented
+        # float32 training policy (0b/8); args.linear_max_iter/linear_tol are
+        # the float64 eval tolerances and are deliberately not forwarded.
+        with open(os.path.join(block_dir, 'block_training_history.json'), 'w') as f:
+            json.dump(history, f, indent=2)
+        save_path = os.path.join(block_dir, 'block_weighter.pt')
+        torch.save(weighter_train.state_dict(), save_path)
+        print(f"  [block] saved trained weighter to {save_path}")
+    return weighter_train, history, block_dir
+
+
+def plot_grid_heatmap(out_dir, c_grid, alpha_grid, mse_grid, title=''):
+    """Heatmap of block-IRLS MSE over the (c, alpha) log grid.
+
+    ``mse_grid`` is (n_c, n_alpha); plotted on log axes with a log color
+    scale (the MSE ranges many decades across the grid).
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(np.log10(mse_grid.clip(min=1e-30)), aspect='auto',
+                   origin='lower',
+                   extent=[np.log10(alpha_grid[0]), np.log10(alpha_grid[-1]),
+                           np.log10(c_grid[0]), np.log10(c_grid[-1])])
+    ax.set_xlabel(r'$\log_{10} \alpha$')
+    ax.set_ylabel(r'$\log_{10} c$')
+    ax.set_title(title or 'Block robust IRLS: MSE over (c, alpha) grid')
+    cb = fig.colorbar(im, ax=ax)
+    cb.set_label(r'$\log_{10}$ MSE')
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, 'robust_block_grid_heatmap.png'), dpi=140)
+    plt.close(fig)
+
+
+def run_grid_sweep(args, out_dir, w_o, device, dtype, seed):
+    """Dense (c, alpha) fixed-curve grid sweep -- the family-vs-training
+    decomposition diagnostic.
+
+    For every (c, alpha) on a log grid (``FixedCauchyWeighter``), run
+    block IRLS at the production block config (N=args.block_N,
+    K=args.block_K) and score the in-sample MSE on blocks held FIXED
+    across the whole grid (the k_sweep fixed-block protocol, seed +
+    trial*1000).  Also score plain / oracle / trained-learned on the same
+    blocks.
+
+    Verdict logic (the decision-relevant decomposition):
+      * grid-best ~ oracle  => the Cauchy family CAN express near-oracle
+        behavior; the learned curve just failed to find it => TRAINING
+        problem (fix: multi-block-per-epoch + log-reparameterization).
+      * grid-best >> oracle => no scalar v(e) curve reaches the oracle;
+        the family itself is the ceiling => FAMILY problem (skip to the
+        richer weighter v(e, |x|) / with memory).
+      * trained >> grid-best confirms the curve was under-converged even
+        relative to the best hand-placed curve.
+
+    Outputs ``grid_sweep.json`` + ``robust_block_grid_heatmap.png`` in
+    ``results/rls_demo/robust_block/``.
+    """
+    from utils.learned_robust import (
+        block_robust_rls, FixedCauchyWeighter, constant_weighter,
+        make_block, oracle_weighter,
+    )
+
+    block_dir = os.path.join(out_dir, 'robust_block')
+    _ensure_dir(block_dir)
+
+    # Trained curve (load or train via the shared helper) + eval cast.
+    weighter_train, history, block_dir = _load_or_train_block_weighter(
+        args, out_dir, device, dtype, seed)
+    weighter = weighter_train.to(device).to(dtype)
+    weighter.eval()
+    const_w = constant_weighter(1.0, dtype=dtype).to(device)
+
+    # Dense log-spaced grids (logspace over the raw ranges).
+    c_grid = np.logspace(np.log10(args.grid_c_lo), np.log10(args.grid_c_hi),
+                         args.grid_n_c)
+    alpha_grid = np.logspace(np.log10(args.grid_alpha_lo),
+                             np.log10(args.grid_alpha_hi), args.grid_n_alpha)
+    print(f"\n=== (c, alpha) grid sweep: N={args.block_N}, K={args.block_K}, "
+          f"n_c={args.grid_n_c}, n_alpha={args.grid_n_alpha}, "
+          f"n_trials={args.n_trials} ===", flush=True)
+
+    # Pre-build one stateless FixedCauchyWeighter per grid point.
+    grid_weights = [[FixedCauchyWeighter(c=float(c), alpha=float(a),
+                                         dtype=dtype).to(device)
+                     for a in alpha_grid] for c in c_grid]
+
+    n_trials = max(1, args.n_trials)
+    mse_plain_acc = 0.0
+    mse_oracle_acc = 0.0
+    mse_learned_acc = 0.0
+    mse_grid = np.zeros((args.grid_n_c, args.grid_n_alpha))
+
+    for trial in range(n_trials):
+        torch.manual_seed(seed + trial * 1000)
+        if device.type == 'cuda':
+            torch.cuda.manual_seed(seed + trial * 1000)
+        w_o_l = torch.randn(args.d, device=device, dtype=dtype)
+        w_o_l = w_o_l / w_o_l.norm()
+        X, d_obs, _, burst = make_block(
+            w_o_l, args.block_N, args.sigma, mode='iid',
+            noise=args.noise, p_burst=args.p_burst, kappa=args.kappa,
+            seed=seed + trial * 1000, dtype=dtype, device=device,
+            return_noise=True)
+        oracle_w = oracle_weighter(burst, dtype=dtype, device=device)
+
+        def _mse(wgt):
+            w = block_robust_rls(X, d_obs, wgt, delta=args.block_delta,
+                                 K=args.block_K, max_iter=args.linear_max_iter,
+                                 tol=args.linear_tol, backward_mode='phantom')
+            return float(((X @ w - X @ w_o_l).pow(2)).mean().item())
+
+        mse_p = _mse(const_w)
+        mse_o = _mse(oracle_w)
+        mse_l = _mse(weighter)
+        mse_plain_acc += mse_p
+        mse_oracle_acc += mse_o
+        mse_learned_acc += mse_l
+        for i in range(args.grid_n_c):
+            for j in range(args.grid_n_alpha):
+                mse_grid[i, j] += _mse(grid_weights[i][j])
+        print(f"  [grid] trial {trial}: plain={mse_p:.4e} "
+              f"learned={mse_l:.4e} oracle={mse_o:.4e}", flush=True)
+
+    plain_mse = mse_plain_acc / n_trials
+    oracle_mse = mse_oracle_acc / n_trials
+    learned_mse = mse_learned_acc / n_trials
+    mse_grid /= n_trials
+    best_ij = np.unravel_index(np.argmin(mse_grid), mse_grid.shape)
+    best_c = float(c_grid[best_ij[0]])
+    best_alpha = float(alpha_grid[best_ij[1]])
+    grid_best_mse = float(mse_grid[best_ij])
+
+    # Verdict: grid-best within 10% of the plain->oracle span => the family
+    # can reach near-oracle => TRAINING problem; otherwise FAMILY ceiling.
+    gap_total = plain_mse - oracle_mse
+    headroom_ratio_grid = (grid_best_mse - oracle_mse) / max(gap_total, 1e-30)
+    verdict = 'TRAINING' if headroom_ratio_grid <= 0.10 else 'FAMILY'
+    trained_vs_grid_ratio = learned_mse / max(grid_best_mse, 1e-30)
+
+    print(f"\n=== Grid-sweep verdict (N={args.block_N}, K={args.block_K}) ===",
+          flush=True)
+    print(f"  plain={plain_mse:.4e}  learned={learned_mse:.4e}  "
+          f"oracle={oracle_mse:.4e}", flush=True)
+    print(f"  grid-best (c={best_c:.4f}, alpha={best_alpha:.4f}): "
+          f"mse={grid_best_mse:.4e}", flush=True)
+    print(f"  headroom_ratio_grid={headroom_ratio_grid:.4f} "
+          f"(grid-best vs oracle over plain->oracle span)", flush=True)
+    print(f"  trained/grid-best ratio={trained_vs_grid_ratio:.4f} "
+          f"(>1 => trained curve under-converged vs best hand-placed curve)",
+          flush=True)
+    print(f"  verdict={verdict}", flush=True)
+
+    plot_grid_heatmap(block_dir, c_grid, alpha_grid, mse_grid,
+                      title=f'Block robust IRLS: MSE over (c, alpha) grid '
+                            f'(N={args.block_N}, K={args.block_K})')
+
+    grid_out = {
+        'note': ('(c, alpha) grid sweep: for every fixed-curve point, block '
+                 'IRLS in-sample MSE at K=args.block_K on blocks held fixed '
+                 'across the grid (k_sweep fixed-block protocol).  Verdict: '
+                 'TRAINING if grid-best ~ oracle (family can express it; '
+                 'training failed); FAMILY if grid-best >> oracle (scalar '
+                 'v(e) ceiling).'),
+        'N': args.block_N,
+        'K': args.block_K,
+        'delta': args.block_delta,
+        'noise': args.noise,
+        'sigma': args.sigma,
+        'p_burst': args.p_burst,
+        'kappa': args.kappa,
+        'n_trials': n_trials,
+        'c_grid': [float(x) for x in c_grid],
+        'alpha_grid': [float(x) for x in alpha_grid],
+        'mse_matrix': mse_grid.tolist(),
+        'plain_mse': plain_mse,
+        'learned_mse': learned_mse,
+        'oracle_mse': oracle_mse,
+        'grid_best': {'c': best_c, 'alpha': best_alpha, 'mse': grid_best_mse},
+        'trained_vs_grid_best_ratio': trained_vs_grid_ratio,
+        'headroom_ratio_grid': headroom_ratio_grid,
+        'verdict': verdict,
+        'weighter': {'c': float(weighter.c.item()),
+                     'alpha': float(weighter.alpha.item())},
+    }
+    with open(os.path.join(block_dir, 'grid_sweep.json'), 'w') as f:
+        json.dump(grid_out, f, indent=2)
+    print(f"  [grid] wrote {block_dir}/grid_sweep.json + "
+          f"robust_block_grid_heatmap.png")
 
 
 def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
@@ -1711,38 +1983,15 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
     from utils.learned_robust import (
         block_robust_rls, digital_block_robust_rls, FabricRobustRLS,
         LearnedRobustWeighter, constant_weighter, make_block, oracle_weighter,
+        FixedCauchyWeighter, MADRobustWeighter,
     )
 
     block_dir = os.path.join(out_dir, 'robust_block')
     _ensure_dir(block_dir)
 
-    # ---- Train or load block weighter ----
-    weighter_train = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
-    if args.block_weighter_path and os.path.exists(args.block_weighter_path):
-        sd = torch.load(args.block_weighter_path, map_location='cpu')
-        weighter_train.load_state_dict(sd)
-        print(f"  [block] loaded trained weighter from {args.block_weighter_path}")
-        history = []
-    else:
-        print(f"  [block] training weighter: epochs={args.block_epochs},"
-              f" N={args.block_N}, K={args.block_K}, delta={args.block_delta},"
-              f" sigma={args.sigma}, p_burst={args.p_burst},"
-              f" kappa={args.kappa}, lr={args.block_lr},"
-              f" backward={args.block_backward_mode}")
-        weighter_train, history = train_robust_weighter_block(
-            d=args.d, N=args.block_N, K=args.block_K, delta=args.block_delta,
-            epochs=args.block_epochs, sigma=args.sigma, p_burst=args.p_burst,
-            kappa=args.kappa, device=device, lr=args.block_lr,
-            seed=seed, log_every=max(1, args.block_epochs // 8),
-            return_history=True, backward_mode=args.block_backward_mode)
-        # Trainer solver defaults (max_iter=50, tol=1e-5) are the documented
-        # float32 training policy (0b/8); args.linear_max_iter/linear_tol are
-        # the float64 eval tolerances and are deliberately not forwarded.
-        with open(os.path.join(block_dir, 'block_training_history.json'), 'w') as f:
-            json.dump(history, f, indent=2)
-        save_path = os.path.join(block_dir, 'block_weighter.pt')
-        torch.save(weighter_train.state_dict(), save_path)
-        print(f"  [block] saved trained weighter to {save_path}")
+    # ---- Train or load block weighter (shared helper) ----
+    weighter_train, history, block_dir = _load_or_train_block_weighter(
+        args, out_dir, device, dtype, seed)
 
     # Cast frozen weighter to eval dtype (decision 10: train float32, eval float64).
     weighter = weighter_train.to(device).to(dtype)
@@ -1750,6 +1999,9 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
     const_w = constant_weighter(1.0, dtype=dtype).to(device)
     init_w = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0).to(device).to(dtype)
     init_w.eval()
+    # Classical robust baselines (MAD-adaptive, per-block scale).
+    huber_w = MADRobustWeighter(mode='huber', dtype=dtype).to(device)
+    hampel_w = MADRobustWeighter(mode='hampel', dtype=dtype).to(device)
 
     # ---- Generate blocks for the K-sweep and N-sweep ----
     # K-sweep: fix N at args.block_N, sweep K.
@@ -1806,6 +2058,8 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
     k_sweep_learned = []
     k_sweep_init = []
     k_sweep_oracle = []
+    k_sweep_huber = []
+    k_sweep_hampel = []
     k_sweep_iters = []
     n_trials = max(1, args.n_trials)
     for K_l in K_values:
@@ -1813,6 +2067,8 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
         mse_learned_acc = 0.0
         mse_init_acc = 0.0
         mse_oracle_acc = 0.0
+        mse_huber_acc = 0.0
+        mse_hampel_acc = 0.0
         for trial in range(n_trials):
             # Hold the block fixed across all K values within a trial
             # (seed depends on trial only, not K) so the K-sweep isolates
@@ -1829,22 +2085,31 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
             mse_l, it_l, _ = block_mse(weighter, X, d_obs, w_o_l, K_l, args.block_delta)
             mse_i, _, _ = block_mse(init_w, X, d_obs, w_o_l, K_l, args.block_delta)
             mse_o, _, _ = block_mse(oracle_w, X, d_obs, w_o_l, K_l, args.block_delta)
+            mse_h, _, _ = block_mse(huber_w, X, d_obs, w_o_l, K_l, args.block_delta)
+            mse_hm, _, _ = block_mse(hampel_w, X, d_obs, w_o_l, K_l, args.block_delta)
             mse_plain_acc += mse_p
             mse_learned_acc += mse_l
             mse_init_acc += mse_i
             mse_oracle_acc += mse_o
+            mse_huber_acc += mse_h
+            mse_hampel_acc += mse_hm
             k_sweep_iters.extend(it_l)
         k_sweep_plain.append(mse_plain_acc / n_trials)
         k_sweep_learned.append(mse_learned_acc / n_trials)
         k_sweep_init.append(mse_init_acc / n_trials)
         k_sweep_oracle.append(mse_oracle_acc / n_trials)
+        k_sweep_huber.append(mse_huber_acc / n_trials)
+        k_sweep_hampel.append(mse_hampel_acc / n_trials)
         print(f"  K={K_l:2d}: plain={k_sweep_plain[-1]:.4e}  "
               f"learned={k_sweep_learned[-1]:.4e}  "
               f"init={k_sweep_init[-1]:.4e}  "
-              f"oracle={k_sweep_oracle[-1]:.4e}", flush=True)
+              f"oracle={k_sweep_oracle[-1]:.4e}  "
+              f"huber={k_sweep_huber[-1]:.4e}  "
+              f"hampel={k_sweep_hampel[-1]:.4e}", flush=True)
 
     plot_block_mse_vs_K(block_dir, K_values, k_sweep_plain, k_sweep_learned,
-                         k_sweep_init, k_sweep_oracle)
+                         k_sweep_init, k_sweep_oracle, mse_huber=k_sweep_huber,
+                         mse_hampel=k_sweep_hampel)
 
     # ---- N-sweep ----
     print(f"\n=== Block robust: N-sweep, K={args.block_K}, "
@@ -1853,6 +2118,8 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
     n_sweep_init = []
     n_sweep_learned = []
     n_sweep_oracle = []
+    n_sweep_huber = []
+    n_sweep_hampel = []
     n_sweep_streaming_plain = []
     n_sweep_streaming_init = []
     n_sweep_streaming_learned = []
@@ -1885,6 +2152,8 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
         mse_init_acc = 0.0
         mse_learned_acc = 0.0
         mse_oracle_acc = 0.0
+        mse_huber_acc = 0.0
+        mse_hampel_acc = 0.0
         mse_str_plain_acc = 0.0
         mse_str_init_acc = 0.0
         mse_str_learned_acc = 0.0
@@ -1900,10 +2169,14 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
             mse_i, _, _ = block_mse(init_w, X, d_obs, w_o_l, args.block_K, args.block_delta)
             mse_l, _, _ = block_mse(weighter, X, d_obs, w_o_l, args.block_K, args.block_delta)
             mse_o, _, _ = block_mse(oracle_w, X, d_obs, w_o_l, args.block_K, args.block_delta)
+            mse_h, _, _ = block_mse(huber_w, X, d_obs, w_o_l, args.block_K, args.block_delta)
+            mse_hm, _, _ = block_mse(hampel_w, X, d_obs, w_o_l, args.block_K, args.block_delta)
             mse_plain_acc += mse_p
             mse_init_acc += mse_i
             mse_learned_acc += mse_l
             mse_oracle_acc += mse_o
+            mse_huber_acc += mse_h
+            mse_hampel_acc += mse_hm
 
             # Three streaming contenders (3x2 matrix, streaming column):
             #   streaming_plain  = classical EW-RLS       (v=1)
@@ -1916,6 +2189,8 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
         n_sweep_init.append(mse_init_acc / n_trials)
         n_sweep_learned.append(mse_learned_acc / n_trials)
         n_sweep_oracle.append(mse_oracle_acc / n_trials)
+        n_sweep_huber.append(mse_huber_acc / n_trials)
+        n_sweep_hampel.append(mse_hampel_acc / n_trials)
         n_sweep_streaming_plain.append(mse_str_plain_acc / n_trials)
         n_sweep_streaming_init.append(mse_str_init_acc / n_trials)
         n_sweep_streaming_learned.append(mse_str_learned_acc / n_trials)
@@ -1923,6 +2198,8 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
               f"init={n_sweep_init[-1]:.4e}  "
               f"learned={n_sweep_learned[-1]:.4e}  "
               f"oracle={n_sweep_oracle[-1]:.4e}  "
+              f"huber={n_sweep_huber[-1]:.4e}  "
+              f"hampel={n_sweep_hampel[-1]:.4e}  "
               f"str_plain={n_sweep_streaming_plain[-1]:.4e}  "
               f"str_init={n_sweep_streaming_init[-1]:.4e}  "
               f"str_learned={n_sweep_streaming_learned[-1]:.4e}", flush=True)
@@ -1963,48 +2240,36 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
 
     # Fit at the train-block seed used by the in-sample sweep, so the
     # OOS score shares the exact same training data.
-    oos_k_plain = []
-    oos_k_learned = []
-    oos_k_init = []
-    oos_k_oracle = []
+    oos_k = {k: [] for k in ('plain', 'learned', 'init', 'oracle', 'huber', 'hampel')}
     for K_l in K_values:
-        acc = {'plain': 0.0, 'learned': 0.0, 'init': 0.0, 'oracle': 0.0}
+        acc = {k: 0.0 for k in oos_k}
         for trial in range(n_trials):
             res = oos_contenders(
-                {'plain': const_w, 'learned': weighter, 'init': init_w},
+                {'plain': const_w, 'learned': weighter, 'init': init_w,
+                 'huber': huber_w, 'hampel': hampel_w},
                 seed_tr=seed + trial * 1000, N_l=args.block_N, K_l=K_l)
             for k in acc:
                 acc[k] += res[k]
-        oos_k_plain.append(acc['plain'] / n_trials)
-        oos_k_learned.append(acc['learned'] / n_trials)
-        oos_k_init.append(acc['init'] / n_trials)
-        oos_k_oracle.append(acc['oracle'] / n_trials)
-        print(f"  OOS K={K_l:2d}: plain={oos_k_plain[-1]:.4e}  "
-              f"learned={oos_k_learned[-1]:.4e}  "
-              f"init={oos_k_init[-1]:.4e}  "
-              f"oracle={oos_k_oracle[-1]:.4e}", flush=True)
+        for k in oos_k:
+            oos_k[k].append(acc[k] / n_trials)
+        print(f"  OOS K={K_l:2d}: " + "  ".join(
+            f"{k}={oos_k[k][-1]:.4e}" for k in oos_k), flush=True)
 
-    oos_n_plain = []
-    oos_n_learned = []
-    oos_n_init = []
-    oos_n_oracle = []
+    oos_n = {k: [] for k in ('plain', 'learned', 'init', 'oracle', 'huber', 'hampel')}
     for N_l in N_values:
-        acc = {'plain': 0.0, 'learned': 0.0, 'init': 0.0, 'oracle': 0.0}
+        acc = {k: 0.0 for k in oos_n}
         for trial in range(n_trials):
             res = oos_contenders(
-                {'plain': const_w, 'learned': weighter, 'init': init_w},
+                {'plain': const_w, 'learned': weighter, 'init': init_w,
+                 'huber': huber_w, 'hampel': hampel_w},
                 seed_tr=seed + trial * 1000 + N_l, N_l=N_l,
                 K_l=args.block_K)
             for k in acc:
                 acc[k] += res[k]
-        oos_n_plain.append(acc['plain'] / n_trials)
-        oos_n_learned.append(acc['learned'] / n_trials)
-        oos_n_init.append(acc['init'] / n_trials)
-        oos_n_oracle.append(acc['oracle'] / n_trials)
-        print(f"  OOS N={N_l:4d}: plain={oos_n_plain[-1]:.4e}  "
-              f"learned={oos_n_learned[-1]:.4e}  "
-              f"init={oos_n_init[-1]:.4e}  "
-              f"oracle={oos_n_oracle[-1]:.4e}", flush=True)
+        for k in oos_n:
+            oos_n[k].append(acc[k] / n_trials)
+        print(f"  OOS N={N_l:4d}: " + "  ".join(
+            f"{k}={oos_n[k][-1]:.4e}" for k in oos_n), flush=True)
 
     # ---- Oracle + OOS headroom verdict ----
     # In-sample k_sweep at K=args.block_K: how much of the plain->oracle
@@ -2023,7 +2288,7 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
     # Threshold at 10%: learned within 10% of the plain->oracle span is
     # effectively at the ceiling; otherwise headroom remains.
     headroom_verdict = 'CEILING' if headroom_ratio <= 0.10 else 'HEADROOM'
-    oos_fixed_ratio = oos_k_learned[eval_idx] / max(oos_k_init[eval_idx], 1e-30)
+    oos_fixed_ratio = oos_k['learned'][eval_idx] / max(oos_k['init'][eval_idx], 1e-30)
     learned_oracle_ratio = learned_k / max(oracle_k, 1e-30)
     print(f"\n=== Oracle + OOS headroom verdict (in-sample k_sweep @ "
           f"K={args.block_K}) ===", flush=True)
@@ -2041,8 +2306,9 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
                          n_sweep_streaming_plain, n_sweep_streaming_init,
                          n_sweep_streaming_learned,
                          mse_oracle=n_sweep_oracle,
-                         oos={'plain': oos_n_plain, 'init': oos_n_init,
-                              'learned': oos_n_learned, 'oracle': oos_n_oracle})
+                         mse_huber=n_sweep_huber, mse_hampel=n_sweep_hampel,
+                         oos={k: oos_n[k] for k in
+                              ('plain', 'init', 'learned', 'oracle', 'huber', 'hampel')})
 
     # ---- Settle iter histogram ----
     if k_sweep_iters:
@@ -2104,6 +2370,9 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
             'init': k_sweep_init,
             # Phase 0: oracle ceiling column (true burst mask).
             'oracle': k_sweep_oracle,
+            # Classical robust baselines (MAD-adaptive, per-block scale).
+            'huber': k_sweep_huber,
+            'hampel': k_sweep_hampel,
         },
         'n_sweep': {
             'N_values': N_values,
@@ -2111,6 +2380,8 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
             'init': n_sweep_init,
             'learned': n_sweep_learned,
             'oracle': n_sweep_oracle,
+            'huber': n_sweep_huber,
+            'hampel': n_sweep_hampel,
             'streaming_plain': n_sweep_streaming_plain,
             'streaming_init': n_sweep_streaming_init,
             'streaming_learned': n_sweep_streaming_learned,
@@ -2126,20 +2397,24 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
                      'same plant; OOS MSE = ||X_test w - X_test w_o||^2 / N.'),
             'K_values': K_values,
             'test_seed_offset': _OOS_SEED_OFFSET,
-            'plain': oos_k_plain,
-            'learned': oos_k_learned,
-            'init': oos_k_init,
-            'oracle': oos_k_oracle,
+            'plain': oos_k['plain'],
+            'learned': oos_k['learned'],
+            'init': oos_k['init'],
+            'oracle': oos_k['oracle'],
+            'huber': oos_k['huber'],
+            'hampel': oos_k['hampel'],
         },
         'oos_n_sweep': {
             'note': ('out-of-sample n_sweep (Phase 0): same protocol as '
                      'oos_k_sweep at K=args.block_K.'),
             'N_values': N_values,
             'test_seed_offset': _OOS_SEED_OFFSET,
-            'plain': oos_n_plain,
-            'learned': oos_n_learned,
-            'init': oos_n_init,
-            'oracle': oos_n_oracle,
+            'plain': oos_n['plain'],
+            'learned': oos_n['learned'],
+            'init': oos_n['init'],
+            'oracle': oos_n['oracle'],
+            'huber': oos_n['huber'],
+            'hampel': oos_n['hampel'],
         },
         'verdict': {
             'note': ('Phase 0 headroom verdict on the in-sample k_sweep at '

@@ -947,3 +947,99 @@ Seven decisions were agreed today:
 - A finite-difference gradient check of the exact backward path at **production scale** (d=16, N=512, K=8) — the one remaining gap in proving the gradient construction is correct.
 - Training was likely under-converged: 25 epochs with only one block per epoch. Averaging gradients over several blocks per epoch, plus a learning-rate schedule, is the training-hardening fallback if Phase 0 shows exploitable headroom.
 - The `wavefront-pairing` spec is auto-linked to the `oracle-oos-headroom` plan by the planning toolkit, but it is unrelated (it belongs to the separate PCU / pcu_standalone hardware project) and does not constrain this work.
+
+---
+
+# Review-response implementation (2026-08-16): grid sweep, MAD baselines, prod-scale gradcheck
+
+Status: implemented. Reviewer feedback from a design critique of the 2026-08-15
+production run; three real implementation items plus a set of doc-only
+corrections. **No new algorithms beyond two fixed weighter primitives.**
+
+## The core diagnostic: training gap vs. family gap
+
+The learned curve (c=0.0832, α=0.1541) assigns `v(0.2) ≈ 0.74` at the burst
+scale (κσ = 0.2), where the oracle assigns ≈ 0. Yet it still won 45% over
+plain — so most of the headroom is *unexploited*. The Cauchy family can express
+near-oracle behavior: `c≈0.05, α≈2.5–3` gives `v(0.2) ≈ 2e-4` while
+`v(0.01) ≈ 0.89`. Training stopped at α=0.154. Why? Three candidates:
+
+1. **Under-convergence** — 25 epochs × 1 block/epoch, per-epoch loss
+   oscillating 6× (0.003–0.019) ⇒ poor gradient SNR.
+2. **Conditioning** — `softplus'(-2.0) = sigmoid(-2.0) ≈ 0.12`, so grads w.r.t.
+   `raw_alpha` are scaled ~8× down near init; pushing α 0.15→2.7 traverses the
+   whole softplus range.
+3. **Family ceiling** — scalar v(e) genuinely cannot do better.
+
+The decomposition: a dense (c, α) grid sweep at production scale.
+- **If grid-best ≈ oracle** ⇒ purely a training problem → apply fixes 1+2
+  (multi-block-per-epoch averaging + log-reparameterization of the weighter).
+- **If grid-best ≫ oracle** ⇒ a family problem → skip to the richer weighter
+  (`v(e,|x|)` / with memory) in Phase 3.
+
+This is more decision-relevant than the oracle alone and costs an afternoon.
+
+## New code (2026-08-16)
+
+- **`src/utils/learned_robust.py`**
+  - `FixedCauchyWeighter(c, alpha)` — stateless fixed-curve primitive
+    (no softplus indirection); also the honest "fixed curve" baseline.
+  - `MADRobustWeighter(mode='huber'|'hampel')` — classical robust weighter:
+    `σ̂ = 1.4826·median|e|` recomputed per IRLS round (per-block adaptivity),
+    Huber `v = min(1, a/|u|)` (a=1.345) / Hampel 3-segment (a, 3a, 8a).
+- **`src/run_rls_demo.py`**
+  - `run_grid_sweep` + `--grid_sweep` (dense 20×20 log grid over c × α by
+    default; `--grid_c_lo/hi/n_c --grid_alpha_lo/hi/n_alpha`). Reuses the
+    k_sweep fixed-block protocol; scores plain / trained / oracle / every grid
+    point on the same blocks at N=block_N, K=block_K. Verdict printed to
+    console and written to `grid_sweep.json` + `robust_block_grid_heatmap.png`.
+  - `_load_or_train_block_weighter` shared helper (single source of truth for
+    the trained curve across `run_robust_block_experiment` and `run_grid_sweep`).
+  - Huber + Hampel added to the k_sweep / n_sweep / oos contender matrices,
+    plots, and `block_metrics.json`.
+- **`src/tests/test_learned_robust.py`** — two new gates:
+  - `test_mad_scale_tracks_noise` (scale adaptivity + no cross-call caching).
+  - `test_huber_hampel_mad_improvement` (beats plain on impulsive; reduces to
+    ~plain on Gaussian).
+- **`src/tests/test_prod_gradcheck.py`** — standalone production-scale FD
+  gradcheck (d=16, N=512, K=8, float64, ±eps on raw_c/raw_alpha, forward-only
+  FD vs exact implicit backward). Deliberately NOT in `run_all.py` / the
+  lightweight suite (~an hour on CPU); run explicitly:
+  `python tests/test_prod_gradcheck.py` (or `--d 8 --N 128 --K 4` for a smoke).
+
+## Doc-only corrections (no code)
+
+1. **"Fixed" curve = the training init.** `init_w` in the contender matrix is a
+   `LearnedRobustWeighter` at its training init (raw_c=-2.25, raw_alpha=-2.0),
+   frozen — not a separately hand-tuned curve. The honest ablation label is
+   **"trained vs. its own initialization"**. The plan text saying "hand-tuned
+   values (c ≈ 0.107)" is misleading and has been corrected in spirit by
+   `FixedCauchyWeighter`, which makes the init's (c, α) explicit.
+2. **Streaming N=256→512 degradation.** A fixed-memory (λ=0.99 ⇒ ~100 samples)
+   filter's steady-state misadjustment does not depend on block length, so the
+   rise at N=512 is most likely burst-transient accumulation over the longer
+   block plus per-N seed variance (fresh block per N in the n_sweep). Pending a
+   2–3 seed rerun; not a bug.
+3. **"Gradient ≈ 10% of the loss floor" is dimensionally meaningless** (gradient
+   and loss have different units). Fine as an internal sniff test; excluded from
+   any paper text.
+4. **Phase 1 leverage-point caveat.** In the channel-estimation framing
+   `d = U·h + bursts + AWGN`, bursts only contaminate `d` — the regressor `U`
+   is the Hankel of *clean* symbols, so there are no leverage points and no
+   `v(e,|x|)` story in Phase 1. That story only exists in Phase 2's
+   preamble→decision-directed equalizer mode, where the regressor is built from
+   received (noisy) samples (errors-in-variables).
+5. **pip install -e vs sys.path.** The cross-repo consumption (learn2optimize →
+   deqnet) currently uses sys.path.append, which works. `pip install -e` is not
+   drop-in: `packages = ["src"]` would install a top-level `src` package
+   (`import src.utils...`), and the internal `from utils...` imports require
+   `src/` on the path anyway. The durable option is a `src/deqnet/` package
+   restructure — deferred; sys.path is fine for a research repo.
+
+## Open items (carried)
+
+- Run the full production-scale grid sweep (Kaggle GPU) and read the TRAINING vs
+  FAMILY verdict. If TRAINING: implement multi-block-per-epoch + log-reparam
+  (contingent, per the review).
+- Run `test_prod_gradcheck.py` at full scale once (CPU or GPU) to close the
+  last gradient-correctness gap.

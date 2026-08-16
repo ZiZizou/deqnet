@@ -195,6 +195,106 @@ def constant_weighter(value=1.0, dtype=None):
     return _Const(value, dtype if dtype is not None else torch.get_default_dtype())
 
 
+class FixedCauchyWeighter(nn.Module):
+    """Stateless generalized-Cauchy weighter with FIXED (c, alpha) buffers.
+
+        v(e) = v_max / (1 + (e/c)^2)^alpha
+
+    The same family as ``LearnedRobustWeighter`` but with frozen,
+    directly-specified curve parameters (no softplus indirection).  Two
+    purposes:
+
+      * the honest ablation contender ("trained vs its own init"): the
+        plan's ``init_w`` is a ``LearnedRobustWeighter`` at its *training*
+        init, which is equivalent but obfuscated.  A ``FixedCauchyWeighter``
+        with the init's (c, alpha) makes the baseline explicit.
+      * the (c, alpha) grid sweep: evaluating ``block_robust_rls`` over a
+        dense grid of fixed curves without inverting softplus.
+    """
+
+    def __init__(self, c=0.107, alpha=0.127, v_max=1.0, dtype=None):
+        super().__init__()
+        dtype = dtype if dtype is not None else torch.get_default_dtype()
+        self.register_buffer('c', torch.tensor(float(c), dtype=dtype))
+        self.register_buffer('alpha', torch.tensor(float(alpha), dtype=dtype))
+        self.register_buffer('v_max', torch.tensor(float(v_max), dtype=dtype))
+
+    def forward(self, e):
+        c = self.c.to(device=e.device, dtype=e.dtype)
+        alpha = self.alpha.to(device=e.device, dtype=e.dtype)
+        v_max = self.v_max.to(device=e.device, dtype=e.dtype)
+        ratio = e / c
+        denom = (1.0 + ratio * ratio).clamp_min(1e-30)
+        v = v_max / denom.pow(alpha)
+        return v.clamp(min=1e-30, max=v_max)
+
+
+class MADRobustWeighter(nn.Module):
+    """Classical robust (Huber / Hampel) weighter with MAD scale normalization.
+
+    The classical state-of-the-art fixed method: it adapts the influence
+    function's scale to the data *per block*, which a static learned curve
+    cannot do.  ``forward(e)`` recomputes, on every call,
+
+        sigma_hat = 1.4826 * median(|e|)
+
+    and returns the IRLS weight for the chosen robust loss:
+
+      mode='huber':   v = 1            if |u| <= a
+                      v = a / |u|      if |u| >  a        (u = e / sigma_hat)
+
+      mode='hampel':  the 3-segment redescending weight with (a, b, r),
+                      b ~ 3a, r ~ 8a by default:
+                          v = 1                 |u| <= a
+                          v = a / |u|           a < |u| <= b
+                          v = a/b * (r-|u|)/(r-b)   b < |u| <= r
+                          v = 0                 |u| > r
+
+    Because ``block_robust_rls`` calls ``weighter(e)`` fresh every outer
+    IRLS iteration, the scale is re-derived from the *current* residual
+    block each call -- the per-block adaptivity property.  No parameters
+    and no cross-call state, so the weight vector for a block depends only
+    on that block's residuals.
+
+    The weights are clamped to (0, 1] so ``R = X^T diag(v) X + delta*I``
+    stays SPD (same invariant as the learned weighter).
+    """
+
+    def __init__(self, mode='huber', a=1.345, b=None, r=None, dtype=None):
+        super().__init__()
+        if mode not in ('huber', 'hampel'):
+            raise ValueError(f"unknown MAD mode: {mode!r}")
+        self.mode = mode
+        # Hampel segment defaults (classical choices, b ~ 3a, r ~ 6-10a).
+        if b is None:
+            b = 3.0 * a
+        if r is None:
+            r = 8.0 * a
+        dtype = dtype if dtype is not None else torch.get_default_dtype()
+        self.register_buffer('a', torch.tensor(float(a), dtype=dtype))
+        self.register_buffer('b', torch.tensor(float(b), dtype=dtype))
+        self.register_buffer('r', torch.tensor(float(r), dtype=dtype))
+
+    def forward(self, e):
+        a = self.a.to(device=e.device, dtype=e.dtype)
+        b = self.b.to(device=e.device, dtype=e.dtype)
+        r = self.r.to(device=e.device, dtype=e.dtype)
+        # MAD-based scale, re-derived per call (no caching).
+        sigma_hat = 1.4826 * e.abs().median()
+        sigma_hat = sigma_hat.clamp_min(1e-12)
+        u = e / sigma_hat
+        au = u.abs()
+        v = torch.ones_like(u)
+        if self.mode == 'huber':
+            v = torch.where(au > a, a / au.clamp_min(1e-30), v)
+        else:  # hampel
+            v = torch.where(au > a, a / au.clamp_min(1e-30), v)
+            ramp = (a / b) * ((r - au) / (r - b)).clamp_min(0.0)
+            v = torch.where(au > b, ramp, v)
+            v = torch.where(au > r, torch.zeros_like(v), v)
+        return v.clamp(min=1e-30, max=1.0)
+
+
 # ----------------------------------------------------------------------------
 # Fabric Robust RLS
 # ----------------------------------------------------------------------------
