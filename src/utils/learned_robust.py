@@ -368,7 +368,8 @@ class DigitalRobustRLS(DigitalRLS):
 
 
 def make_block(w_o, T, sigma, *, mode='iid', noise='gaussian', p_burst=0.02,
-               kappa=20.0, seed=0, dtype=torch.float64, device='cpu'):
+               kappa=20.0, seed=0, dtype=torch.float64, device='cpu',
+               return_noise=False):
     """Generate (X, d_obs) block of shape (T, d) and (T,).
 
     Mirrors ``run_rls_demo.make_stream`` but without the streaming
@@ -378,10 +379,31 @@ def make_block(w_o, T, sigma, *, mode='iid', noise='gaussian', p_burst=0.02,
     i.i.d. N(0, I) samples (or AR(1) for the ``mode='ar1'`` case) --
     a (T, d) observation matrix.
 
+    Parameters
+    ----------
+    w_o : (d,) tensor
+        True plant (unit-norm by convention).
+    T : int
+        Number of samples in the block.
+    sigma : float
+        Nominal Gaussian noise scale.
+    return_noise : bool, optional
+        If True, also return the true additive noise ``nu`` and the true
+        burst mask ``burst`` (Phase 0 oracle-oos-headroom).  In
+        simulation these are available exactly (``nu = d_obs - X @ w_o``
+        and the generator's Bernoulli burst gate), so the oracle weighter
+        needs no generator-state replay.  Default False keeps the return
+        type backward-compatible.
+
     Returns
     -------
     X : (T, d) tensor
     d_obs : (T,) tensor, ``X @ w_o + nu``
+    nu : (T,) tensor, optional (if ``return_noise=True``)
+        True additive noise.
+    burst : (T,) tensor, optional (if ``return_noise=True``)
+        True burst indicator (1 = burst, 0 = clean; all-zero for a clean
+        block).
     """
     # Lazy import to avoid the circular dependency (plan decision 9).
     _make_noise = _lookup_attr('_make_noise')
@@ -399,10 +421,68 @@ def make_block(w_o, T, sigma, *, mode='iid', noise='gaussian', p_burst=0.02,
             X[t] = rho * X[t - 1] + (1.0 - rho * rho) ** 0.5 * eps[t]
     else:
         raise ValueError(f"unknown mode: {mode!r}")
-    nu = _make_noise(T, sigma, mode=noise, p_burst=p_burst, kappa=kappa,
-                     generator=g, dtype=dtype, device=device)
+    nu, burst = _make_noise(T, sigma, mode=noise, p_burst=p_burst, kappa=kappa,
+                            generator=g, dtype=dtype, device=device,
+                            return_burst=True)
     d_obs = X @ w_o + nu
+    if return_noise:
+        return X, d_obs, nu, burst
     return X, d_obs
+
+
+def oracle_weighter(burst, *, floor=1e-3, dtype=None, device='cpu'):
+    """Oracle influence weighter: v=1 on clean rows, v~0 on burst rows.
+
+    Phase 0 oracle ceiling (plan ``oracle-oos-headroom``).  The oracle
+    knows the TRUE burst mask (in simulation, the noise generator's
+    Bernoulli gate, returned by ``make_block(..., return_noise=True)``)
+    and down-weights exactly those rows to ``floor``.  It is an
+    idealized upper bound on any learned/fixed curve: perfect
+    contamination knowledge, no reliance on residual magnitudes.
+
+    ``floor`` is kept strictly positive (default 1e-3) so that
+    ``R = X^T diag(v) X + delta*I`` stays SPD (the same invariant the
+    ``LearnedRobustWeighter`` guarantees via v_t > 0).  As ``floor -> 0``
+    the oracle approaches the exact reweighted-LS "discard the bursts"
+    solution.
+
+    On a clean block (``burst`` all-zero, e.g. ``noise='gaussian'``) the
+    mask is empty and the oracle reduces to plain batch LS -- the
+    ``test_oracle_bound`` gate checks exactly this reduction.
+
+    Parameters
+    ----------
+    burst : (T,) tensor
+        True burst indicator (1 = burst, 0 = clean).
+    floor : float, optional
+        Weight applied to burst rows (default 1e-3).
+    dtype : torch.dtype, optional
+        Buffer dtype (defaults to the current default dtype).
+    device : str or torch.device, optional
+        Buffer device (defaults to 'cpu').
+
+    Returns
+    -------
+    nn.Module
+        Callable ``(e) -> v`` returning per-sample weights in
+        ``[floor, 1]`` broadcastable to the residual shape (T,).
+    """
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+
+    class _Oracle(nn.Module):
+        def __init__(self, burst, floor, dtype, device):
+            super().__init__()
+            self.register_buffer('mask', burst.to(device).bool())
+            self.register_buffer('floor', torch.tensor(float(floor), dtype=dtype))
+
+        def forward(self, e):
+            # v = 1 everywhere, then floor exactly the burst rows.
+            v = torch.ones_like(e)
+            v = torch.where(self.mask.to(e.device), self.floor.to(e.dtype), v)
+            return v
+
+    return _Oracle(burst, floor, dtype, device)
 
 
 def block_robust_rls(X, d, weighter, delta, K, *, settle=None, w_init=None,

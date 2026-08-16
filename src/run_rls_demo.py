@@ -320,7 +320,8 @@ def batch_experiment_metrics(w_fabric, R, p, X, d, R0, w_o=None, weight=1.0):
 # ----------------------------------------------------------------------------
 
 def _make_noise(T, sigma, mode='gaussian', p_burst=0.02, kappa=20.0,
-                generator=None, dtype=torch.float64, device='cpu'):
+                generator=None, dtype=torch.float64, device='cpu',
+                return_burst=False):
     """Per-sample additive noise nu_t.
 
     mode='gaussian':
@@ -337,16 +338,32 @@ def _make_noise(T, sigma, mode='gaussian', p_burst=0.02, kappa=20.0,
     ``generator`` is the torch.Generator used to draw the randn and rand
     tensors; passing an explicit generator keeps the noise deterministic
     for a given seed (plan decision 6: backward-compatible defaults).
+
+    ``return_burst`` (Phase 0 oracle-oos-headroom): if True, return
+    ``(nu, burst)`` where ``burst`` is the (T,) 0/1 indicator of which
+    samples were drawn as bursts (1 = burst, 0 = clean).  This is the
+    TRUE burst mask -- the simulation's Bernoulli gate, already computed
+    here -- which the oracle weighter needs for perfect down-weighting.
+    In gaussian mode there are no bursts, so ``burst`` is an all-zero
+    tensor (a clean block).  Default False keeps the return type
+    backward-compatible.
     """
     if mode == 'gaussian':
-        return sigma * torch.randn(T, generator=generator, dtype=dtype, device=device)
+        nu = sigma * torch.randn(T, generator=generator, dtype=dtype, device=device)
+        if return_burst:
+            burst = torch.zeros(T, dtype=dtype, device=device)
+            return nu, burst
+        return nu
     if mode == 'impulsive':
         z1 = torch.randn(T, generator=generator, dtype=dtype, device=device)
         z2 = torch.randn(T, generator=generator, dtype=dtype, device=device)
         # Use a separate rand stream for the burst gate so the impulsive
         # noise is reproducible from the same seed (gate 5 checks this).
         burst = (torch.rand(T, generator=generator, dtype=dtype, device=device) < p_burst).to(dtype)
-        return sigma * (z1 + kappa * burst * z2)
+        nu = sigma * (z1 + kappa * burst * z2)
+        if return_burst:
+            return nu, burst
+        return nu
     raise ValueError(f"unknown noise mode: {mode!r}")
 
 
@@ -1530,8 +1547,13 @@ def train_robust_weighter_block(d, *, N=512, K=8, delta=1e-2, epochs=80,
     return weighter
 
 
-def plot_block_mse_vs_K(out_dir, K_values, mse_plain, mse_learned, mse_init):
-    """Plot MSE-vs-K for the three block contenders (one curve per contender)."""
+def plot_block_mse_vs_K(out_dir, K_values, mse_plain, mse_learned, mse_init,
+                        mse_oracle=None):
+    """Plot MSE-vs-K for the block contenders (one curve per contender).
+
+    Phase 0 (oracle-oos-headroom): ``mse_oracle`` adds the 4th (oracle)
+    curve -- the idealized true-burst-mask ceiling for any curve.
+    """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -1542,9 +1564,13 @@ def plot_block_mse_vs_K(out_dir, K_values, mse_plain, mse_learned, mse_init):
                 linewidth=1.5)
     ax.semilogy(K_values, mse_init, '^--', color='C0', label='init-only block IRLS',
                 linewidth=1.5, alpha=0.7)
+    if mse_oracle is not None:
+        ax.semilogy(K_values, mse_oracle, 'd-', color='C6',
+                    label='oracle block IRLS (true burst mask)',
+                    linewidth=1.5)
     ax.set_xlabel('K (outer IRLS iterations)')
     ax.set_ylabel(r'MSE $= \|X w^K - X w_o\|^2 / N$')
-    ax.set_title('Block robust IRLS: MSE vs K')
+    ax.set_title('Block robust IRLS: MSE vs K (oracle ceiling)')
     ax.legend()
     ax.grid(True, which='both', alpha=0.3)
     fig.tight_layout()
@@ -1555,19 +1581,35 @@ def plot_block_mse_vs_K(out_dir, K_values, mse_plain, mse_learned, mse_init):
 def plot_block_mse_vs_N(out_dir, N_values,
                         mse_plain, mse_init, mse_learned,
                         mse_streaming_plain, mse_streaming_init,
-                        mse_streaming_learned):
+                        mse_streaming_learned,
+                        mse_oracle=None, oos=None):
     """Plot MSE-vs-N for the 3x2 contender matrix (block vs streaming
-    by non-robust / fixed-curve-robust / learned-robust)."""
+    by non-robust / fixed-curve-robust / learned-robust).
+
+    Phase 0 (oracle-oos-headroom) extensions:
+      * ``mse_oracle`` adds the oracle batch curve to the in-sample panel.
+      * ``oos`` (dict with 'plain'/'init'/'learned'/'oracle' lists) adds
+        a second, out-of-sample panel: fit on a train block, score on a
+        fresh test block.  All keys optional; absent curves are skipped.
+    """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(8, 5))
+    n_panels = 2 if oos is not None else 1
+    fig, axes = plt.subplots(1, n_panels, figsize=(8 if n_panels == 1 else 14, 5))
+    if n_panels == 1:
+        axes = [axes]
+
+    ax = axes[0]
     ax.semilogy(N_values, mse_plain, 'o-', color='C1',
                 label='plain batch LS (v=1)', linewidth=1.5)
     ax.semilogy(N_values, mse_init, '^--', color='C0',
                 label='init block IRLS (fixed curve)', linewidth=1.5, alpha=0.7)
     ax.semilogy(N_values, mse_learned, 's-', color='C3',
                 label='learned block IRLS', linewidth=1.5)
+    if mse_oracle is not None:
+        ax.semilogy(N_values, mse_oracle, 'd-', color='C6',
+                    label='oracle block IRLS (true burst mask)', linewidth=1.5)
     ax.semilogy(N_values, mse_streaming_plain, 'v--', color='C5',
                 label='streaming EW-RLS (v=1)', linewidth=1.5, alpha=0.7)
     ax.semilogy(N_values, mse_streaming_init, 'P--', color='C4',
@@ -1576,9 +1618,28 @@ def plot_block_mse_vs_N(out_dir, N_values,
                 label='streaming learned IR-RLS', linewidth=1.5, alpha=0.7)
     ax.set_xlabel('block size N')
     ax.set_ylabel(r'MSE $= \|X w^K - X w_o\|^2 / N$')
-    ax.set_title('Block robust IRLS: MSE vs N (3x2 contender matrix)')
-    ax.legend(fontsize=8)
+    ax.set_title('In-sample (fit and score on the same block)')
+    ax.legend(fontsize=7)
     ax.grid(True, which='both', alpha=0.3)
+
+    if oos is not None:
+        ax2 = axes[1]
+        def _plot_oos(key, fmt, color, label):
+            if oos.get(key) is not None:
+                ax2.semilogy(N_values, oos[key], fmt, color=color, label=label,
+                             linewidth=1.5)
+        _plot_oos('plain', 'o-', 'C1', 'plain batch LS (v=1)')
+        _plot_oos('init', '^--', 'C0', 'init block IRLS (fixed curve)')
+        _plot_oos('learned', 's-', 'C3', 'learned block IRLS')
+        _plot_oos('oracle', 'd-', 'C6', 'oracle block IRLS (true burst mask)')
+        ax2.set_xlabel('block size N')
+        ax2.set_ylabel(r'OOS MSE $= \|X_{test} w - X_{test} w_o\|^2 / N$')
+        ax2.set_title('Out-of-sample (fit on train block, score on a fresh block)')
+        ax2.legend(fontsize=8)
+        ax2.grid(True, which='both', alpha=0.3)
+        fig.suptitle('Block robust IRLS: MSE vs N '
+                     '(3x2 contender matrix + oracle + OOS)', fontsize=10)
+
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, 'robust_block_mse_vs_N.png'), dpi=140)
     plt.close(fig)
@@ -1615,9 +1676,16 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
       5. streaming fixed-curve IR-RLS    (init weighter, per-sample)
       6. streaming learned IR-RLS        (trained weighter, per-sample)
 
+    Phase 0 additions (oracle-oos-headroom): an oracle batch contender
+    (7) that knows the true burst mask, plus out-of-sample scoring:
+
+      7. oracle block IRLS               (true burst mask -> v=floor on bursts)
+
     Plots:
-      * robust_block_mse_vs_K.png      -- MSE vs K (plain / init / learned block)
-      * robust_block_mse_vs_N.png      -- MSE vs N (all 6 contenders)
+      * robust_block_mse_vs_K.png      -- MSE vs K (plain / init / learned /
+                                          oracle block)
+      * robust_block_mse_vs_N.png      -- MSE vs N (all 6 contenders + oracle,
+                                          plus an out-of-sample panel)
       * robust_block_settle_iters.png  -- LinearSolveLayer iter distribution
 
     The k_sweep holds each trial's block fixed across all K values (seed
@@ -1629,11 +1697,20 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
     the best fixed-curve depth (argmin over the init column of the k_sweep)
     and the learned block at that same K — isolates "better curve" from
     "more depth."
+
+    Out-of-sample scoring (Phase 0): for every (K, N) block a fresh test
+    block is generated with the SAME plant w_o but a seed offset
+    (``_OOS_SEED_OFFSET``), each contender fits on the train block, and the
+    fitted w is scored as ``||X_test w - X_test w_o||^2 / N`` against the
+    test block.  Stored as ``oos_k_sweep`` / ``oos_n_sweep``.  A headroom
+    verdict (CEILING vs HEADROOM) is computed on the in-sample k_sweep at
+    K=args.block_K: if the oracle-vs-learned gap is <= 10% of the
+    plain-vs-oracle gap, learned is essentially at the ceiling.
     """
     # Lazy import (plan decision 9).
     from utils.learned_robust import (
         block_robust_rls, digital_block_robust_rls, FabricRobustRLS,
-        LearnedRobustWeighter, constant_weighter, make_block,
+        LearnedRobustWeighter, constant_weighter, make_block, oracle_weighter,
     )
 
     block_dir = os.path.join(out_dir, 'robust_block')
@@ -1680,6 +1757,11 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
     K_values = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32] if args.block_K_max is None else list(args.block_K_max)
     N_values = [32, 64, 128, 256, 512] if args.block_N_max is None else list(args.block_N_max)
 
+    # Out-of-sample seed offset: the test block shares the plant w_o but is
+    # drawn from a seed far from every training/sweep seed, so it is a fresh
+    # block (Phase 0 oracle-oos-headroom).
+    _OOS_SEED_OFFSET = 1_000_000
+
     def make_block_fixed(seed_):
         torch.manual_seed(seed_)
         if device.type == 'cuda':
@@ -1704,44 +1786,65 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
         mse = float(((X @ w - X @ w_o_l).pow(2)).mean().item())
         return mse, settle_iters, w
 
+    def oos_block_mse(weighter_, X_tr, d_tr, X_te, w_o_l, K_l, delta_l):
+        """Out-of-sample block IRLS: fit on the train block (X_tr, d_tr) at
+        depth K_l, then score the fitted w on the FRESH test block X_te as
+        ``||X_te @ w - X_te @ w_o_l||^2 / N`` (Phase 0).  Returns the OOS
+        MSE (settle iters are not collected here to keep the OOS sweep
+        cheap and focused on the ceiling question).
+        """
+        w = block_robust_rls(X_tr, d_tr, weighter_, delta=delta_l, K=K_l,
+                             max_iter=args.linear_max_iter,
+                             tol=args.linear_tol,
+                             backward_mode='phantom')
+        return float(((X_te @ w - X_te @ w_o_l).pow(2)).mean().item())
+
     # ---- K-sweep ----
     print(f"\n=== Block robust: K-sweep, N={args.block_N}, "
           f"noise={args.noise}, sigma={args.sigma} ===", flush=True)
     k_sweep_plain = []
     k_sweep_learned = []
     k_sweep_init = []
+    k_sweep_oracle = []
     k_sweep_iters = []
     n_trials = max(1, args.n_trials)
     for K_l in K_values:
         mse_plain_acc = 0.0
         mse_learned_acc = 0.0
         mse_init_acc = 0.0
+        mse_oracle_acc = 0.0
         for trial in range(n_trials):
             # Hold the block fixed across all K values within a trial
             # (seed depends on trial only, not K) so the K-sweep isolates
             # the depth effect from per-K data noise.  The 'plain' column
             # (v=1, K-independent) is the self-check: it should be ~flat.
             w_o_l = make_block_fixed(seed + trial * 1000)
-            X, d_obs = make_block(w_o_l, args.block_N, args.sigma, mode='iid',
-                                  noise=args.noise, p_burst=args.p_burst,
-                                  kappa=args.kappa, seed=seed + trial * 1000,
-                                  dtype=dtype, device=device)
+            X, d_obs, nu, burst = make_block(
+                w_o_l, args.block_N, args.sigma, mode='iid',
+                noise=args.noise, p_burst=args.p_burst,
+                kappa=args.kappa, seed=seed + trial * 1000,
+                dtype=dtype, device=device, return_noise=True)
+            oracle_w = oracle_weighter(burst, dtype=dtype, device=device)
             mse_p, _, _ = block_mse(const_w, X, d_obs, w_o_l, K_l, args.block_delta)
             mse_l, it_l, _ = block_mse(weighter, X, d_obs, w_o_l, K_l, args.block_delta)
             mse_i, _, _ = block_mse(init_w, X, d_obs, w_o_l, K_l, args.block_delta)
+            mse_o, _, _ = block_mse(oracle_w, X, d_obs, w_o_l, K_l, args.block_delta)
             mse_plain_acc += mse_p
             mse_learned_acc += mse_l
             mse_init_acc += mse_i
+            mse_oracle_acc += mse_o
             k_sweep_iters.extend(it_l)
         k_sweep_plain.append(mse_plain_acc / n_trials)
         k_sweep_learned.append(mse_learned_acc / n_trials)
         k_sweep_init.append(mse_init_acc / n_trials)
+        k_sweep_oracle.append(mse_oracle_acc / n_trials)
         print(f"  K={K_l:2d}: plain={k_sweep_plain[-1]:.4e}  "
               f"learned={k_sweep_learned[-1]:.4e}  "
-              f"init={k_sweep_init[-1]:.4e}", flush=True)
+              f"init={k_sweep_init[-1]:.4e}  "
+              f"oracle={k_sweep_oracle[-1]:.4e}", flush=True)
 
     plot_block_mse_vs_K(block_dir, K_values, k_sweep_plain, k_sweep_learned,
-                         k_sweep_init)
+                         k_sweep_init, k_sweep_oracle)
 
     # ---- N-sweep ----
     print(f"\n=== Block robust: N-sweep, K={args.block_K}, "
@@ -1749,6 +1852,7 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
     n_sweep_plain = []
     n_sweep_init = []
     n_sweep_learned = []
+    n_sweep_oracle = []
     n_sweep_streaming_plain = []
     n_sweep_streaming_init = []
     n_sweep_streaming_learned = []
@@ -1780,21 +1884,26 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
         mse_plain_acc = 0.0
         mse_init_acc = 0.0
         mse_learned_acc = 0.0
+        mse_oracle_acc = 0.0
         mse_str_plain_acc = 0.0
         mse_str_init_acc = 0.0
         mse_str_learned_acc = 0.0
         for trial in range(n_trials):
             w_o_l = make_block_fixed(seed + trial * 1000 + N_l)
-            X, d_obs = make_block(w_o_l, N_l, args.sigma, mode='iid',
-                                  noise=args.noise, p_burst=args.p_burst,
-                                  kappa=args.kappa, seed=seed + trial * 1000 + N_l,
-                                  dtype=dtype, device=device)
+            X, d_obs, nu, burst = make_block(
+                w_o_l, N_l, args.sigma, mode='iid',
+                noise=args.noise, p_burst=args.p_burst,
+                kappa=args.kappa, seed=seed + trial * 1000 + N_l,
+                dtype=dtype, device=device, return_noise=True)
+            oracle_w = oracle_weighter(burst, dtype=dtype, device=device)
             mse_p, _, _ = block_mse(const_w, X, d_obs, w_o_l, args.block_K, args.block_delta)
             mse_i, _, _ = block_mse(init_w, X, d_obs, w_o_l, args.block_K, args.block_delta)
             mse_l, _, _ = block_mse(weighter, X, d_obs, w_o_l, args.block_K, args.block_delta)
+            mse_o, _, _ = block_mse(oracle_w, X, d_obs, w_o_l, args.block_K, args.block_delta)
             mse_plain_acc += mse_p
             mse_init_acc += mse_i
             mse_learned_acc += mse_l
+            mse_oracle_acc += mse_o
 
             # Three streaming contenders (3x2 matrix, streaming column):
             #   streaming_plain  = classical EW-RLS       (v=1)
@@ -1806,20 +1915,134 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
         n_sweep_plain.append(mse_plain_acc / n_trials)
         n_sweep_init.append(mse_init_acc / n_trials)
         n_sweep_learned.append(mse_learned_acc / n_trials)
+        n_sweep_oracle.append(mse_oracle_acc / n_trials)
         n_sweep_streaming_plain.append(mse_str_plain_acc / n_trials)
         n_sweep_streaming_init.append(mse_str_init_acc / n_trials)
         n_sweep_streaming_learned.append(mse_str_learned_acc / n_trials)
         print(f"  N={N_l:4d}: plain={n_sweep_plain[-1]:.4e}  "
               f"init={n_sweep_init[-1]:.4e}  "
               f"learned={n_sweep_learned[-1]:.4e}  "
+              f"oracle={n_sweep_oracle[-1]:.4e}  "
               f"str_plain={n_sweep_streaming_plain[-1]:.4e}  "
               f"str_init={n_sweep_streaming_init[-1]:.4e}  "
               f"str_learned={n_sweep_streaming_learned[-1]:.4e}", flush=True)
 
+    # ---- Out-of-sample sweeps (Phase 0 oracle-oos-headroom) ----
+    # For every (K, N) train block, generate a fresh test block with the
+    # SAME plant w_o but a large seed offset; fit each batch contender on
+    # the train block and score the fitted w on the test block.  This
+    # measures generalization (does the learned/fixed/oracle curve fit on
+    # data it never saw), which the in-sample metric cannot see.
+    print(f"\n=== Block robust: out-of-sample sweeps "
+          f"(test-seed offset {_OOS_SEED_OFFSET}) ===", flush=True)
+
+    def oos_contenders(contenders, seed_tr, N_l, K_l):
+        """Fit all batch contenders on a train block, score each on a
+        fresh test block; return dict of OOS MSEs."""
+        w_o_l = make_block_fixed(seed_tr)
+        X_tr, d_tr, _, burst_tr = make_block(
+            w_o_l, N_l, args.sigma, mode='iid',
+            noise=args.noise, p_burst=args.p_burst,
+            kappa=args.kappa, seed=seed_tr,
+            dtype=dtype, device=device, return_noise=True)
+        X_te, d_te = make_block(
+            w_o_l, N_l, args.sigma, mode='iid',
+            noise=args.noise, p_burst=args.p_burst,
+            kappa=args.kappa, seed=seed_tr + _OOS_SEED_OFFSET,
+            dtype=dtype, device=device)
+        # The oracle is fit on the same train block, so its burst mask
+        # comes from the train block's noise (no double generation).
+        oracle_w = oracle_weighter(burst_tr, dtype=dtype, device=device)
+        out = {}
+        for name, wgt in contenders.items():
+            out[name] = oos_block_mse(wgt, X_tr, d_tr, X_te, w_o_l, K_l,
+                                      args.block_delta)
+        out['oracle'] = oos_block_mse(oracle_w, X_tr, d_tr, X_te, w_o_l, K_l,
+                                      args.block_delta)
+        return out
+
+    # Fit at the train-block seed used by the in-sample sweep, so the
+    # OOS score shares the exact same training data.
+    oos_k_plain = []
+    oos_k_learned = []
+    oos_k_init = []
+    oos_k_oracle = []
+    for K_l in K_values:
+        acc = {'plain': 0.0, 'learned': 0.0, 'init': 0.0, 'oracle': 0.0}
+        for trial in range(n_trials):
+            res = oos_contenders(
+                {'plain': const_w, 'learned': weighter, 'init': init_w},
+                seed_tr=seed + trial * 1000, N_l=args.block_N, K_l=K_l)
+            for k in acc:
+                acc[k] += res[k]
+        oos_k_plain.append(acc['plain'] / n_trials)
+        oos_k_learned.append(acc['learned'] / n_trials)
+        oos_k_init.append(acc['init'] / n_trials)
+        oos_k_oracle.append(acc['oracle'] / n_trials)
+        print(f"  OOS K={K_l:2d}: plain={oos_k_plain[-1]:.4e}  "
+              f"learned={oos_k_learned[-1]:.4e}  "
+              f"init={oos_k_init[-1]:.4e}  "
+              f"oracle={oos_k_oracle[-1]:.4e}", flush=True)
+
+    oos_n_plain = []
+    oos_n_learned = []
+    oos_n_init = []
+    oos_n_oracle = []
+    for N_l in N_values:
+        acc = {'plain': 0.0, 'learned': 0.0, 'init': 0.0, 'oracle': 0.0}
+        for trial in range(n_trials):
+            res = oos_contenders(
+                {'plain': const_w, 'learned': weighter, 'init': init_w},
+                seed_tr=seed + trial * 1000 + N_l, N_l=N_l,
+                K_l=args.block_K)
+            for k in acc:
+                acc[k] += res[k]
+        oos_n_plain.append(acc['plain'] / n_trials)
+        oos_n_learned.append(acc['learned'] / n_trials)
+        oos_n_init.append(acc['init'] / n_trials)
+        oos_n_oracle.append(acc['oracle'] / n_trials)
+        print(f"  OOS N={N_l:4d}: plain={oos_n_plain[-1]:.4e}  "
+              f"learned={oos_n_learned[-1]:.4e}  "
+              f"init={oos_n_init[-1]:.4e}  "
+              f"oracle={oos_n_oracle[-1]:.4e}", flush=True)
+
+    # ---- Oracle + OOS headroom verdict ----
+    # In-sample k_sweep at K=args.block_K: how much of the plain->oracle
+    # improvement does the learned weighter capture?
+    try:
+        eval_idx = K_values.index(args.block_K)
+    except ValueError:
+        eval_idx = len(K_values) - 1
+    plain_k = k_sweep_plain[eval_idx]
+    learned_k = k_sweep_learned[eval_idx]
+    oracle_k = k_sweep_oracle[eval_idx]
+    gap_total = plain_k - oracle_k
+    gap_learned = plain_k - learned_k
+    headroom_gap = learned_k - oracle_k
+    headroom_ratio = headroom_gap / max(gap_total, 1e-30)
+    # Threshold at 10%: learned within 10% of the plain->oracle span is
+    # effectively at the ceiling; otherwise headroom remains.
+    headroom_verdict = 'CEILING' if headroom_ratio <= 0.10 else 'HEADROOM'
+    oos_fixed_ratio = oos_k_learned[eval_idx] / max(oos_k_init[eval_idx], 1e-30)
+    learned_oracle_ratio = learned_k / max(oracle_k, 1e-30)
+    print(f"\n=== Oracle + OOS headroom verdict (in-sample k_sweep @ "
+          f"K={args.block_K}) ===", flush=True)
+    print(f"  plain={plain_k:.4e}  learned={learned_k:.4e}  "
+          f"oracle={oracle_k:.4e}", flush=True)
+    print(f"  learned/oracle ratio={learned_oracle_ratio:.4f} "
+          f"(~1.0 => learned ~ oracle => CEILING)", flush=True)
+    print(f"  OOS learned-vs-fixed ratio={oos_fixed_ratio:.4f} "
+          f"(<1.0 => learned generalizes better than fixed curve)", flush=True)
+    print(f"  headroom_ratio={headroom_ratio:.4f} "
+          f"verdict={headroom_verdict}", flush=True)
+
     plot_block_mse_vs_N(block_dir, N_values,
                          n_sweep_plain, n_sweep_init, n_sweep_learned,
                          n_sweep_streaming_plain, n_sweep_streaming_init,
-                         n_sweep_streaming_learned)
+                         n_sweep_streaming_learned,
+                         mse_oracle=n_sweep_oracle,
+                         oos={'plain': oos_n_plain, 'init': oos_n_init,
+                              'learned': oos_n_learned, 'oracle': oos_n_oracle})
 
     # ---- Settle iter histogram ----
     if k_sweep_iters:
@@ -1879,12 +2102,15 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
             'plain': k_sweep_plain,
             'learned': k_sweep_learned,
             'init': k_sweep_init,
+            # Phase 0: oracle ceiling column (true burst mask).
+            'oracle': k_sweep_oracle,
         },
         'n_sweep': {
             'N_values': N_values,
             'plain': n_sweep_plain,
             'init': n_sweep_init,
             'learned': n_sweep_learned,
+            'oracle': n_sweep_oracle,
             'streaming_plain': n_sweep_streaming_plain,
             'streaming_init': n_sweep_streaming_init,
             'streaming_learned': n_sweep_streaming_learned,
@@ -1892,6 +2118,45 @@ def run_robust_block_experiment(args, out_dir, w_o, device, dtype, seed):
             # written under the key 'streaming'.  Keep it so downstream
             # readers of the old key continue to work.
             'streaming': n_sweep_streaming_learned,
+        },
+        'oos_k_sweep': {
+            'note': ('out-of-sample k_sweep (Phase 0): fit each batch '
+                     'contender on the train block (same seeds as k_sweep), '
+                     'score the fitted w on a fresh test block with the '
+                     'same plant; OOS MSE = ||X_test w - X_test w_o||^2 / N.'),
+            'K_values': K_values,
+            'test_seed_offset': _OOS_SEED_OFFSET,
+            'plain': oos_k_plain,
+            'learned': oos_k_learned,
+            'init': oos_k_init,
+            'oracle': oos_k_oracle,
+        },
+        'oos_n_sweep': {
+            'note': ('out-of-sample n_sweep (Phase 0): same protocol as '
+                     'oos_k_sweep at K=args.block_K.'),
+            'N_values': N_values,
+            'test_seed_offset': _OOS_SEED_OFFSET,
+            'plain': oos_n_plain,
+            'learned': oos_n_learned,
+            'init': oos_n_init,
+            'oracle': oos_n_oracle,
+        },
+        'verdict': {
+            'note': ('Phase 0 headroom verdict on the in-sample k_sweep at '
+                     'K=args.block_K.  headroom_ratio = '
+                     '(learned - oracle) / (plain - oracle): ~0 means the '
+                     'learned weighter captures essentially all the '
+                     'plain->oracle improvement (CEILING); ~1 means most of '
+                     'the gap remains (HEADROOM).  CEILING/HEADROOM split '
+                     'at headroom_ratio <= 0.10.'),
+            'at_K': args.block_K,
+            'plain_mse': float(plain_k),
+            'learned_mse': float(learned_k),
+            'oracle_mse': float(oracle_k),
+            'learned_oracle_ratio': float(learned_oracle_ratio),
+            'oos_learned_vs_init_ratio': float(oos_fixed_ratio),
+            'headroom_ratio': float(headroom_ratio),
+            'headroom_verdict': headroom_verdict,
         },
         'fixed_curve_vs_learned': {
             'note': ('best fixed-curve depth (min over init column) vs '

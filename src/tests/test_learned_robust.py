@@ -253,7 +253,7 @@ from utils.learned_robust import (
     LearnedRobustWeighter, FabricRobustRLS, DigitalRobustRLS,
     constant_weighter,
     block_robust_rls, digital_block_robust_rls, make_block,
-    measure_phantom_vs_exact_bias,
+    measure_phantom_vs_exact_bias, oracle_weighter,
 )
 from run_rls_demo import (
     DigitalRLS, FabricRLS, _make_noise, make_stream,
@@ -911,9 +911,197 @@ def test_phantom_vs_exact_bias(d=4, N=16, K=4, delta=1e-2, sigma=0.01,
               f"direction is biased.  See the bias in "
               f"block_metrics.json.")
 
+# ----------------------------------------------------------------------------
+# Phase 0 gates (oracle-oos-headroom plan): oracle ceiling + OOS scoring.
+# ----------------------------------------------------------------------------
+
+
+def test_oracle_bound(d=6, N=128, delta=1e-2, K=4, sigma=0.01, p_burst=0.02,
+                      kappa=20.0, seed=0, epochs=20, lr=1e-2, n_trials=2):
+    """Phase 0 gate 1 (oracle-oos-headroom): the oracle is an upper bound.
+
+    On an impulsive block the oracle (true burst mask, v=floor on bursts)
+    must be the best of the three:  oracle <= learned <= plain.
+    On a clean block (noise='gaussian', no bursts) the oracle mask is
+    empty, so the oracle must reduce to plain batch LS: oracle ~= plain.
+    """
+    torch.manual_seed(seed)
+    weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    optimizer = torch.optim.Adam(weighter.parameters(), lr=lr)
+
+    for epoch in range(epochs):
+        w_o = torch.randn(d, dtype=torch.float32)
+        w_o = w_o / w_o.norm()
+        X, d_obs = make_block(w_o, N, sigma, mode='iid',
+                              noise='impulsive', p_burst=p_burst,
+                              kappa=kappa, seed=seed + epoch,
+                              dtype=torch.float32, device='cpu')
+        w_K = block_robust_rls(X, d_obs, weighter, delta=delta, K=K,
+                               max_iter=50, tol=1e-5, backward_mode='phantom')
+        loss = (X @ w_K - X @ w_o).pow(2).sum() + 10.0 * (w_K - w_o).pow(2).sum()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    const_w = constant_weighter(1.0, dtype=torch.float64)
+    w_here = weighter.to(torch.float64)
+
+    # Impulsive block: oracle <= learned <= plain.
+    mse_plain_list = []
+    mse_learned_list = []
+    mse_oracle_list = []
+    for trial in range(n_trials):
+        w_o = torch.randn(d, dtype=torch.float64)
+        w_o = w_o / w_o.norm()
+        X, d_obs, nu, burst = make_block(w_o, N, sigma, mode='iid',
+                                         noise='impulsive', p_burst=p_burst,
+                                         kappa=kappa, seed=seed + 1000 + trial,
+                                         dtype=torch.float64, device='cpu',
+                                         return_noise=True)
+        oracle_w = oracle_weighter(burst, dtype=torch.float64)
+        # Sanity: the burst mask must be non-trivial under impulsive noise.
+        assert burst.sum().item() > 0, \
+            f"impulsive block had no bursts (seed={seed + 1000 + trial})"
+        assert nu.shape == d_obs.shape, f"nu shape {nu.shape} != d_obs {d_obs.shape}"
+        w_plain = block_robust_rls(X, d_obs, const_w, delta=delta, K=0)
+        w_learned = block_robust_rls(X, d_obs, w_here, delta=delta, K=K,
+                                     max_iter=200, tol=1e-10, beta=1.0,
+                                     backward_mode='exact')
+        w_oracle = block_robust_rls(X, d_obs, oracle_w, delta=delta, K=K,
+                                    max_iter=200, tol=1e-10, beta=1.0,
+                                    backward_mode='exact')
+        mse = lambda w: float(((X @ w - X @ w_o).pow(2)).mean().item())
+        mse_plain_list.append(mse(w_plain))
+        mse_learned_list.append(mse(w_learned))
+        mse_oracle_list.append(mse(w_oracle))
+        print(f"  [oracle bound trial {trial}] plain={mse(w_plain):.4e} "
+              f"learned={mse(w_learned):.4e} oracle={mse(w_oracle):.4e}")
+
+    mse_plain = sum(mse_plain_list) / n_trials
+    mse_learned = sum(mse_learned_list) / n_trials
+    mse_oracle = sum(mse_oracle_list) / n_trials
+    print(f"  [oracle bound] mean plain={mse_plain:.4e} learned={mse_learned:.4e} "
+          f"oracle={mse_oracle:.4e}")
+    # oracle must be no worse than learned, learned no worse than plain
+    # (relative slack for solver noise at the K=0-vs-K solves).
+    assert mse_oracle <= mse_learned * (1 + 1e-9) + 1e-18, \
+        f"oracle should be <= learned: oracle={mse_oracle:.4e}, learned={mse_learned:.4e}"
+    assert mse_learned <= mse_plain * (1 + 1e-9) + 1e-18, \
+        f"learned should be <= plain: learned={mse_learned:.4e}, plain={mse_plain:.4e}"
+
+    # Clean block (no bursts): oracle mask empty -> oracle reduces to
+    # plain batch LS (v=1 everywhere -> same reweighted system every K).
+    w_o = torch.randn(d, dtype=torch.float64)
+    w_o = w_o / w_o.norm()
+    Xc, dc, nuc, burstc = make_block(w_o, N, sigma, mode='iid',
+                                     noise='gaussian', p_burst=p_burst,
+                                     kappa=kappa, seed=seed + 2000,
+                                     dtype=torch.float64, device='cpu',
+                                     return_noise=True)
+    assert burstc.sum().item() == 0, \
+        f"clean (gaussian) block should have no bursts, got {burstc.sum().item()}"
+    oracle_c = oracle_weighter(burstc, dtype=torch.float64)
+    w_plain_c = block_robust_rls(Xc, dc, const_w, delta=delta, K=0)
+    w_oracle_c = block_robust_rls(Xc, dc, oracle_c, delta=delta, K=K,
+                                  max_iter=200, tol=1e-10, beta=1.0,
+                                  backward_mode='exact')
+    mse_plain_c = float(((Xc @ w_plain_c - Xc @ w_o).pow(2)).mean().item())
+    mse_oracle_c = float(((Xc @ w_oracle_c - Xc @ w_o).pow(2)).mean().item())
+    rel_c = abs(mse_oracle_c - mse_plain_c) / max(mse_plain_c, 1e-30)
+    print(f"  [oracle bound clean] plain={mse_plain_c:.4e} oracle={mse_oracle_c:.4e} "
+          f"rel_diff={rel_c:.4e}")
+    assert rel_c < 1e-6, \
+        f"oracle must reduce to plain LS on a clean block: rel_diff={rel_c:.4e}"
+
+
+def test_oos_monotonicity(d=6, delta=1e-2, K=4, sigma=0.01, p_burst=0.02,
+                          kappa=20.0, seed=0, epochs=20, lr=1e-2, n_trials=6):
+    """Phase 0 gate 2 (oracle-oos-headroom): out-of-sample monotonicity.
+
+    Batch OOS (fit on a train block, score on a fresh test block with the
+    same plant) must improve as the train block grows: more training data
+    -> better plant estimate -> lower OOS error.  The OOS estimator
+    ``||X_test w - X_test w_o||^2/N`` has high per-trial variance (X_test
+    is redrawn every trial), so the gate tests:
+      * the span direction for the learned weighter (OOS at N=512 must
+        beat OOS at N=128);
+      * strict step-by-step monotonicity for the ORACLE (the cleanest
+        signal -- perfectly discards bursts, so its OOS is dominated by
+        the deterministic LS bias that shrinks with N);
+      * the oracle ceiling holds out-of-sample at every N (oracle <=
+        learned).
+    """
+    torch.manual_seed(seed)
+    weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    optimizer = torch.optim.Adam(weighter.parameters(), lr=lr)
+
+    for epoch in range(epochs):
+        w_o = torch.randn(d, dtype=torch.float32)
+        w_o = w_o / w_o.norm()
+        X, d_obs = make_block(w_o, 128, sigma, mode='iid',
+                              noise='impulsive', p_burst=p_burst,
+                              kappa=kappa, seed=seed + epoch,
+                              dtype=torch.float32, device='cpu')
+        w_K = block_robust_rls(X, d_obs, weighter, delta=delta, K=K,
+                               max_iter=50, tol=1e-5, backward_mode='phantom')
+        loss = (X @ w_K - X @ w_o).pow(2).sum() + 10.0 * (w_K - w_o).pow(2).sum()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    w_here = weighter.to(torch.float64)
+    oos_learned = []
+    oos_oracle = []
+    for N in [128, 256, 512]:
+        acc_l, acc_o = 0.0, 0.0
+        for trial in range(n_trials):
+            w_o = torch.randn(d, dtype=torch.float64)
+            w_o = w_o / w_o.norm()
+            Xtr, dtr, nu, burst = make_block(w_o, N, sigma, mode='iid',
+                                             noise='impulsive', p_burst=p_burst,
+                                             kappa=kappa,
+                                             seed=seed + 1000 + trial + N,
+                                             dtype=torch.float64, device='cpu',
+                                             return_noise=True)
+            # Fresh test block, same plant, seed offset far from training.
+            Xte, dte = make_block(w_o, N, sigma, mode='iid',
+                                  noise='impulsive', p_burst=p_burst,
+                                  kappa=kappa,
+                                  seed=seed + 1000 + trial + N + 1_000_000,
+                                  dtype=torch.float64, device='cpu')
+            w_l = block_robust_rls(Xtr, dtr, w_here, delta=delta, K=K,
+                                   max_iter=200, tol=1e-10, beta=1.0,
+                                   backward_mode='exact')
+            oracle_w = oracle_weighter(burst, dtype=torch.float64)
+            w_o_ = block_robust_rls(Xtr, dtr, oracle_w, delta=delta, K=K,
+                                    max_iter=200, tol=1e-10, beta=1.0,
+                                    backward_mode='exact')
+            oos_l = float(((Xte @ w_l - Xte @ w_o).pow(2)).mean().item())
+            oos_or = float(((Xte @ w_o_ - Xte @ w_o).pow(2)).mean().item())
+            acc_l += oos_l
+            acc_o += oos_or
+        oos_learned.append(acc_l / n_trials)
+        oos_oracle.append(acc_o / n_trials)
+        print(f"  [oos monotone N={N}] learned={oos_learned[-1]:.4e} "
+              f"oracle={oos_oracle[-1]:.4e}")
+
+    print(f"  [oos monotone] learned: {[f'{x:.4e}' for x in oos_learned]}")
+    print(f"  [oos monotone] oracle:  {[f'{x:.4e}' for x in oos_oracle]}")
+    # Span monotonicity: more training data must help across the N range.
+    assert oos_learned[-1] < oos_learned[0], \
+        f"OOS learned should improve with N (span): {oos_learned}"
+    # Oracle OOS is the cleanest signal -- strictly step-monotone in N.
+    assert oos_oracle[0] > oos_oracle[1] > oos_oracle[2], \
+        f"OOS oracle should improve monotonically with N: {oos_oracle}"
+    # Oracle ceiling holds out-of-sample at every N.
+    for oo, ll in zip(oos_oracle, oos_learned):
+        assert oo <= ll * (1 + 1e-9) + 1e-18, \
+            f"OOS oracle should be <= learned: oracle={oo:.4e}, learned={ll:.4e}"
+
+
 if __name__ == '__main__':
     print("=" * 60)
-    print("Phase 0 + Phase 1 + Phase 1.5 gates")
+    print("Phase 0 + Phase 1 + Phase 1.5 + oracle-oos gates")
     print("=" * 60)
     # Phase 0
     test_linear_solve_layer_gradients_flow()
@@ -936,4 +1124,7 @@ if __name__ == '__main__':
     test_block_robust_impulsive_improvement()
     test_block_robust_grad_flow()
     test_phantom_vs_exact_bias()
-    print("\nAll Phase 0 + Phase 1 + Phase 1.5 gates passed.")
+    # Phase 0 (oracle-oos-headroom)
+    test_oracle_bound()
+    test_oos_monotonicity()
+    print("\nAll Phase 0 + Phase 1 + Phase 1.5 + oracle-oos gates passed.")

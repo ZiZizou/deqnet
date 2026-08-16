@@ -800,3 +800,150 @@ Per-sample cold solves at T=128 × epochs × (implicit backward) will dominate w
 ## Verdict
 
 Decisions 1–11 are individually validated; findings A–E are real and correctly resolved; the progress claims are honest. The plan is approved for implementation **with one required change (#1: re-init `raw_c` or explicitly budget for the c-traversal)** and four amendments (#2–#5) to be written into the gates before Phase 1 code is run, plus #6 as an optional performance item. The most dangerous open risk is not in the decisions — it's that gate 6's Gaussian control can pass while the impulsive experiment still shows nothing because of issue #1, and you'd misread that as "robust weighting doesn't help." Fix the init scale first.
+
+---
+
+# Current codebase state + forward design decisions (2026-08-15)
+
+This section is written in plain language, treating nothing as obvious. Every abbreviation, argument, and concept is spelled out the first time it appears, so the section can be read without any prior context.
+
+## Background: what the experiment actually does
+
+The project is about **robust equalization** — estimating an unknown transmitted signal from noisy, contaminated measurements. The classic workhorse is **RLS (Recursive Least Squares)**: a way to fit a linear model to data while updating the estimate incrementally as new samples arrive. The robust variant used here is **IRLS (Iteratively Reweighted Least Squares)**: instead of fitting once and trusting every data point equally, you (1) fit the model, (2) compute every data point's error (residual), (3) **re-weight** each point so that points with large errors count less in the next fit, and (4) repeat for **K** rounds.
+
+The weighting is controlled by a small parametric **"curve"** with two numbers:
+- **c** — the error magnitude at which the curve begins "turning down"; errors much larger than c get down-weighted.
+- **alpha (α)** — how aggressively the down-weighting ramps up as the error grows.
+
+The curve form is `v(e) = v_max / (1 + (e/c)^2)^alpha`, where `v(e)` is the weight assigned to a sample whose residual is `e`.
+
+Three versions of the algorithm were compared:
+- **plain**: plain least squares, every sample weighted equally. This is the "do nothing" baseline.
+- **init / fixed curve**: IRLS with the curve parameters hard-coded at hand-tuned values (c ≈ 0.107).
+- **learned**: IRLS with the curve parameters **trained by gradient descent**, i.e., c and α are adjusted to minimize the final fitting error. Treating the whole reweighting loop as a differentiable machine is called **L2O (learning to optimize)**, and the trained curve is the "learned weighter."
+- **oracle** (planned, not yet built): a hypothetical perfect curve that is told exactly which samples are contaminated — an upper bound on what any learned curve could ever achieve.
+
+The experiment is run on a **block** — a chunk of N samples solved all at once — which is why this is called **block IRLS**. The driver script is `src/run_rls_demo.py`, run in this session on Kaggle with two NVIDIA T4 GPUs (`2×T4`).
+
+**Every command-line argument, explained:**
+- `--train_robust_block`: run the block-IRLS experiment (as opposed to the streaming variant).
+- `--noise impulsive`: contaminate the data with "impulsive" noise — rare, very large spikes — on top of ordinary Gaussian noise.
+- `--gpu`: use the GPU.
+- `--d 16`: each data sample is a 16-dimensional vector (input dimension).
+- `--n_trials 10`: run 10 independent trials and average the results, so the numbers are not one lucky (or unlucky) draw.
+- `--block_N 512`: each block contains 512 samples.
+- `--block_K 8`: run 8 IRLS reweighting rounds per block.
+- `--block_epochs 25`: train for 25 epochs (each epoch = one pass over the training data).
+- `--block_lr 1e-2`: learning rate of 0.01 for the optimizer (Adam).
+
+Output artifacts live in `C:\Users\Atharva\Downloads\deqnet_training_outputs`:
+- `block_metrics.txt` — the numeric result tables reproduced below.
+- `block_training_history.txt` — how the curve parameters moved during training.
+- three `.png` plots — the same results drawn as graphs.
+
+## Current state (as of this session)
+
+The project has three earlier phases documented in this file: Phase 0, Phase 1 (the streaming baseline), and Phase 1.5 (block robust IRLS). All three are **implemented and passing their tests**: 18 individual test "gates" in `src/tests/test_learned_robust.py`, plus the full suite `tests/run_all.py`, all verified on **`ssr0`** (the server `ssr0.eng.uwaterloo.ca`, where both repositories live and are edited via `ssh ssr0`). Phase 2 (the Learned-Prox ISTA equalizer framing described elsewhere in this file) is **not started**; the decisions below are its lead-in. **No code changed this session** — the work was running the experiment, reading the results, and agreeing on the direction forward.
+
+## Production-scale results (2026-08-15)
+
+This run uses the **fixed k_sweep seed pattern**: the random seed is `seed + trial*1000`, with no per-K perturbation, so every trial reuses the exact same data at every value of K. That makes the sweep a clean isolation of "depth of reweighting." Because of this, the absolute numbers here **supersede** the earlier 2026-08-13 Kaggle run (whose per-K values were confounded by different random data at each K — noted in the "Completed 3×2 contender matrix" section of this file). Self-check PASS: the `plain` column is flat at **2.7924e-05 at every K**, exactly as it must be since plain ignores K.
+
+Trained weighter: **c = 0.0832, α = 0.1541**, reached by monotone drift from c = 0.1003, α = 0.1281 across all 25 epochs. The per-epoch loss oscillates between ~0.003 and ~0.019 — this is expected because each epoch draws a fresh random block ("plant/block randomization"), so the loss jiggles; the meaningful learning signal is the smooth parameter drift.
+
+### K-sweep — varying the number of reweighting rounds
+
+Block size fixed at N=512, 10 trials averaged, K ∈ {0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32}. Numbers are average squared error (MSE, mean squared error); **smaller is better**.
+
+| K | plain | init (fixed curve) | learned |
+|---|---|---|---|
+| 0 | 2.792e-5 | 2.792e-5 | 2.792e-5 |
+| 1 | 2.792e-5 | 1.818e-5 | 1.550e-5 |
+| 2–32 | 2.792e-5 (flat) | ~1.808e-5 (flat) | ~1.534e-5 (flat) |
+
+Reading this table:
+- At K=0 all three are identical by construction (K=0 means a single equal-weight least-squares solve).
+- The `plain` row never moves — it does no reweighting, so depth is irrelevant to it.
+- Both init and learned drop sharply after the first reweighting round (K=1), then go **flat by K≈2–3**. "Saturates by K≈2–3" means running more than 2–3 rounds buys essentially nothing.
+- In percentage terms at equal depth: **learned is −45.0% better than plain**, the hand-tuned fixed curve is **−35.3% better than plain**, and **learned is −15.1% better than the hand-tuned curve** — that 15% is "the separation" we care about.
+- `fixed_curve_vs_learned`: the best fixed-curve depth was K=24, giving 1.808e-5; the learned curve at the same K=24 gives 1.534e-5.
+
+### N-sweep — varying the block size
+
+K=8 fixed, one block per value of N, six contenders compared. Columns prefixed `str_` are **streaming** (process samples one at a time, continuously updating with a **forgetting factor λ=0.99** that gradually discounts old samples, giving an effective memory of roughly 100 samples); unprefixed columns are **batch** (collect the whole block of N samples, then solve once).
+
+| N | plain | init | learned | str_plain | str_init | str_learned |
+|---|---|---|---|---|---|---|
+| 32 | 1.03e-3 | 9.09e-4 | 8.63e-4 | 1.85e-3 | 2.73e-3 | 3.30e-3 |
+| 64 | 1.14e-4 | 8.95e-5 | 8.02e-5 | 2.69e-4 | 3.45e-4 | 3.84e-4 |
+| 128 | 6.67e-5 | 4.76e-5 | 4.19e-5 | 1.05e-4 | 8.59e-5 | 8.14e-5 |
+| 256 | 4.85e-5 | 3.45e-5 | 3.02e-5 | 7.86e-5 | 5.66e-5 | 4.99e-5 |
+| 512 | 3.35e-5 | 2.10e-5 | **1.77e-5** | 1.10e-4 | 6.44e-5 | **5.36e-5** |
+
+Reading this table:
+- The batch columns improve **monotonically** (always in the same direction) as N grows — more data in a block means a better fit.
+- The streaming columns get **worse from N=256 to N=512** — with only ~100 samples of effective memory, feeding a streaming filter a bigger block does not help.
+- At N=512, learned batch (1.77e-5) is roughly **3× better** than the best streaming result (5.36e-5), and even plain batch (3.35e-5) beats every streaming variant. Conclusion: **for this block task, batch processing is the right regime.**
+
+### Phantom vs exact gradients (the "backward mode" question)
+
+Training needs the gradient (derivative) of the loss with respect to the curve parameters. The project has two ways to compute it, selected by the `backward_mode` option:
+- `'exact'`: compute the gradient correctly, straight through the reweighting loop.
+- `'phantom'`: a shortcut that pretends the weights are constant during the loop (an approximation).
+
+A diagnostic compares the two at the trained curve:
+- **rel_bias = 2.74e27** — the relative disagreement between the two gradients is astronomically large.
+- phantom gradient magnitude ≈ **2.30e24** versus exact gradient ≈ **8.40e-4**.
+
+The phantom mode's **VJP (vector-Jacobian product**, the standard automatic-differentiation primitive for backpropagation) is catastrophically wrong once K reweighting rounds are chained together. So **the phantom mode is unusable, and `backward_mode='exact'` is the correct default** — which is what we already use. This matches the open issue recorded in the 2026-08-13 section of this file.
+
+### The plots
+
+The three PNGs were also inspected with an image-analysis model, and they match the tables above:
+- `robust_block_mse_vs_K.png`: three curves on a semilogy axis (logarithmic y-scale), learned lowest, flattening by K≈2.
+- `robust_block_mse_vs_N.png`: six curves; the batch family sits below (better than) the streaming family, and the streaming family rises at N=512.
+- `robust_block_settle_iters.png`: a histogram of how many iterations the internal linear solver took per reweighting round (a "settle"). Most solves converge in **1 iteration** (mode = 1), mean ≈ 3, tail to ~16.
+
+## Analysis: why the separation is only ~15%, and why the exact gradient is tiny (8.4e-4)
+
+Both observations trace back to the same place. In plain terms:
+
+1. **IRLS converges to a fixed point, so depth stops mattering.** After the loop, the solution is `w* = (Xᵀ diag(v) X + δI)⁻¹ Xᵀ diag(v) d`. In words: `w*` is the least-squares fit of the data matrix `X` to the target `d`, where each sample is multiplied by its curve weight `v`, and `δI` adds a tiny regularization ridge (δ is a small positive constant; `I` is the identity matrix; `diag(v)` means a diagonal matrix with the weights `v` on the diagonal; `ᵀ` is the transpose). By K≈2–3 both curves reach their own fixed point, and the score is measured **in-sample** (same data used for fitting and scoring). So the remaining separation is decided **entirely by how each curve weights the contaminated samples** — here about 10 burst rows out of 512 (2%) — and not by running more rounds.
+2. **The hand-tuned curve was already good.** Its knee c≈0.107 sits between the ordinary noise scale **σ = 0.01** (σ is the Gaussian noise standard deviation) and the burst scale **κσ = 0.2** (κ = 20 is the burst multiplier; a burst sample is 20× louder than normal noise). At a burst-sized error the fixed curve still assigns weight ≈ 0.82. The learned curve (c falls to ≈0.083, α rises to ≈0.154) squeezes the boundary region a bit harder — that squeeze is the ~15%. The loss surface is flat because contamination is only 2% of samples and those are 20σ outliers: any sane curve flags them.
+3. **The tiny exact gradient (8.4e-4) is expected, not a bug.** It is the derivative of a *sum-scale* loss (~0.0077 ≈ 512 × 1.5e-5, i.e., the per-sample errors summed over the block) with respect to **`raw_c`** (the raw, unconstrained parameter from which c is derived via a softplus, so that c stays positive). It is evaluated **at the trained optimum**, where gradients naturally approach zero. Per sample it is ~1.6e-6 per unit of raw_c — about 10% of the loss floor. The **Adam** optimizer normalizes by the root-mean-square (RMS) of past gradient magnitudes, so the absolute size of the gradient sets nothing; only its direction and signal-to-noise ratio matter, and those are clearly healthy (the parameters drift monotonically and the held-out gains are real). By contrast, the phantom gradient of 2.3e24 is the genuinely broken one.
+4. **So neither "the gradient code is wrong" nor "there is nothing to learn" is supported.** The exact backward path has been verified against **FD gradcheck** (finite-difference gradient checking: perturb a parameter slightly and compare the analytic derivative against the numerically measured slope) at small scale (d=4, relative error < 1e-5), and training demonstrably extracted a real learnable signal (the 15% held-out gain at equal depth). The one thing still open: **there is no finite-difference check at production scale (d=16, N=512, K=8)** — that correctness is currently inferred from training behavior, not directly verified.
+
+## Forward design decisions (locked 2026-08-15)
+
+The user's goal: **get a bigger separation between the learned IR-RLS and the hand-tuned fixed IR-RLS** — i.e., give the learned weighter more to learn. Right now the block experiment contaminates the data with **only one kind of non-ideality**: impulsive spikes on the target `d` (each sample has a 2% chance — a Bernoulli draw — of being a burst of magnitude 20× the normal noise) plus ordinary Gaussian noise. The input samples `X` are independent standard-normal vectors (written `X ~ iid N(0,I)`). There is **no ISI, no crosstalk, no nonlinearity, and the contamination level is fixed and known** to the person tuning the curve.
+
+Seven decisions were agreed today:
+
+1. **Measure the oracle + out-of-sample ceiling first** (this is the existing plan `oracle-oos-headroom`). Build an **oracle** contender that knows exactly which samples are bursts and down-weights them to near zero. The oracle's score is the *ceiling* — the best any curve could possibly do. Then also score **out-of-sample (OOS)**: fit the curve on one block, then evaluate on a *fresh* block it never saw. Two possible verdicts: if the oracle ≈ learned, then ~15% is the problem's ceiling and we must change the regime or the architecture; if the oracle is much better than learned, there is **headroom** we are failing to exploit, and we should harden training.
+2. **Add channel-based non-idealities** (the user's "more types of ISI and/or interference"). The sources come from the companion `learn2optimize` repository on the same server:
+   - `advanced_channel_gen.py` — generates *synthetic* channels: a decaying impulse response plus a resonant reflection, slow time-varying drift, and an optional power-amplifier tanh nonlinearity (currently disabled).
+   - `s4p_channel.py` — real measured channels in **S4P format** (4-port S-parameters; S-parameters are the standard "scattering parameter" way to characterize high-speed electrical links) from the **IEEE 802.3ck** copper-cable standard, with 426 channel geometries in `processed_802_3ck`. It provides the **thru** response (the intended signal path), **FEXT** (far-end crosstalk) and **NEXT** (near-end crosstalk) from independent aggressor bit streams, plus **AWGN (additive white Gaussian noise)** at 15–25 dB **SNR** (signal-to-noise ratio).
+   - `config.py` — sets **CH_TAPS=50**, meaning each channel is modeled as a 50-tap FIR (finite impulse response) filter.
+   
+   Taxonomy of what these add and whether they help separation:
+   - **Contamination-regime knobs** — lower burst multiplier (κ≈5), mixtures of burst magnitudes (κ-mixture), higher or non-stationary burst probability (`p_burst`), heavy-tailed noise — are the *real* separation drivers and require **zero** changes to the algorithm.
+   - **ISI through the thru channel is linear**, so RLS will simply absorb it — it adds realism but not separation.
+   - **Structured interference / leverage points** (e.g., crosstalk that correlates with other symbols, or "leverage" samples with extreme inputs that dominate the fit) could only be exploited by a *richer* weighter — e.g., weighting as a function of both error and input magnitude, `v(e, |x|)`, or giving the curve memory.
+3. **Synthetic channels first.** Use `advanced_channel_gen.py` before real 802.3ck data: no dataset files to move, runs anywhere, fully controllable. Real channels come later.
+4. **Frame the task as a full L2O equalizer benchmark.** Drop the learned IR-RLS into the existing `learn2optimize` benchmark harness (the scripts `benchmark_lms_limit.py` / `benchmark_nlms.py` set the pattern). New contenders: a *streaming* learned equalizer (reusing `FabricRobustRLS` — a delayed-embedding regressor that turns the received sample stream into overlapping feature vectors, plus decision feedback) and a *block* learned equalizer. Baselines: **DFE** (decision-feedback equalizer), **FFE** (feed-forward equalizer), **NLMS** (normalized least mean squares), and **RLS**. Metrics: **BER** (bit error rate) and steady-state **MSE**, across the grid of channel × SNR × burst-magnitude.
+5. **Everything runs on `ssr0`.** Both repos already live there; CPU is plenty at these sizes; the synthetic-channel path has no Kaggle dataset-portability concern; even Phase 0 (oracle/OOS) runs there.
+6. **Cross-repo import.** The `learn2optimize` benchmark scripts will import deqnet's `LearnedRobustWeighter`, `FabricRobustRLS`, and `block_robust_rls` by appending deqnet's directory to Python's **`sys.path`** (the module search path). Single source of truth: deqnet stays the owner of the robust machinery; learn2optimize only consumes it.
+7. **Block-equalizer operating mode: preamble solve → decision-directed.** The block IR-RLS first solves for its equalizer taps using a known training **preamble** (a stretch of symbols the receiver knows exactly), then switches to **decision-directed** tracking (feeding its own hard decisions back as if they were known symbols). This matches the batch contender's behavior to the streaming one.
+
+## Roadmap (phased; Phase 0 is the existing `oracle-oos-headroom` plan)
+
+- **Phase 0 — Oracle + out-of-sample ceiling (deqnet block experiment).** Modify `make_block` to optionally return the true noise so an oracle can be built (`return_noise=True`); add an `oracle_weighter` that down-weights known bursts to near zero; extend the metrics JSON with `k_sweep.oracle` and the OOS sweeps `oos_k_sweep` / `oos_n_sweep`; draw the oracle as a fourth curve on the K plot plus an OOS panel on the N plot; add a test `test_oracle_bound` (oracle ≤ learned ≤ plain on impulsive data; oracle ≈ plain on clean data) and an OOS monotonicity gate. Verdict: **CEILING** (oracle ≈ learned) vs **HEADROOM** (oracle much better than learned). Runs on ssr0.
+- **Phase 1 — Synthetic-channel retraining (mechanism proof).** Make the block source pluggable: generate **PAM-2** symbols (two-level pulse-amplitude modulation, i.e., binary symbols), build a **Hankel regressor** `U` (a matrix of overlapping delayed copies of the transmitted signal — this is what lets a linear equalizer undo channel ISI), pass it through a parametric impulse response `h`, and produce the received block as `d = U·h + bursts + AWGN`. Retrain the weighter in this equalizer context and re-run learned-vs-fixed-vs-plain plus oracle and OOS on channel blocks.
+- **Phase 2 — L2O equalizer-bench integration.** Cross-repo import; streaming + block learned equalizers vs DFE/FFE/NLMS/RLS baselines; BER + steady-state MSE across channel × SNR × burst-magnitude; out-of-sample generalization to unseen channels.
+- **Phase 3 — Interpret + document.** Final verdict: if the distribution of contamination regimes produces real separation, the story is "adaptive robust equalizer > hand-tuned fixed-curve > plain"; otherwise scalar error-only weighting has hit its ceiling, motivating the richer-weighter design (`v(e,|x|)` / with memory).
+
+## Open items carried forward
+
+- A finite-difference gradient check of the exact backward path at **production scale** (d=16, N=512, K=8) — the one remaining gap in proving the gradient construction is correct.
+- Training was likely under-converged: 25 epochs with only one block per epoch. Averaging gradients over several blocks per epoch, plus a learning-rate schedule, is the training-hardening fallback if Phase 0 shows exploitable headroom.
+- The `wavefront-pairing` spec is auto-linked to the `oracle-oos-headroom` plan by the planning toolkit, but it is unrelated (it belongs to the separate PCU / pcu_standalone hardware project) and does not constrain this work.
