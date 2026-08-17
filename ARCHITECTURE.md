@@ -29,8 +29,16 @@ src/
 ├── utils/
 │   ├── deq_solver.py           # Anderson, CG-backward, contraction check
 │   ├── circuit_block.py        # Device models, CircuitLayer, EquilibriumSolve, EquilibriumBlock
+│   ├── circuit_stamp.py        # TransformerConductanceBank, LeakageToGround,
+│   │                           # WeightedGramCircuitLayer/Solve -- element-level
+│   │                           # circuit-stamp backend for weighted-Gram IRLS
+│   │                           # (see §2.5 and docs/weighted_gram_circuit.md)
+│   ├── learned_robust.py       # Phase 1/1.5 IRLS, block_robust_rls(backend=...)
 │   ├── model.py                # CircuitNet (DEQ/ODE branching)
 │   └── topology.py             # Graph generators (edge-list topologies)
+├── docs/
+│   └── weighted_gram_circuit.md  # Circuit-stamp design note (element mapping,
+│                                 # transformer/multiport limitations, parity gates)
 ├── configs/
 │   ├── config_deq_toyregress.yaml
 │   ├── config_deq_twomoon.yaml
@@ -41,11 +49,18 @@ src/
 │   ├── test_devices.py         # 8 tests
 │   ├── test_rhs.py             # 6 tests
 │   ├── test_equilibrium_solve.py  # 7 tests
-│   └── test_deq_end_to_end.py  # 3 tests
+│   ├── test_deq_end_to_end.py  # 3 tests
+│   ├── test_batch_rls.py       # 8 tests (FabricBatchRLS, run by run_all.py)
+│   ├── test_learned_robust.py  # 28 tests (robust weighter; standalone suite)
+│   ├── test_weighted_gram_circuit.py  # 9 gates + certificate (standalone suite)
+│   └── test_prod_gradcheck.py  # production-scale gradcheck (separate runner)
 └── main_deq.py                 # Training entrypoint
 ```
 
-All 32 tests pass (verified).
+All 40 tests pass via `run_all.py` (verified, `seed=42`).  The
+standalone `test_weighted_gram_circuit.py` (10 gates + 1 certificate)
+also passes in float64 CPU and is *not* yet registered in
+`run_all.py` (per the design-note "Gates 1–3 first" discipline).
 
 ---
 
@@ -281,36 +296,55 @@ A single `torch.autograd.Function` encapsulating forward + backward:
 **Forward** (`EquilibriumSolve.forward`):
 
 ```python
+method = cfg.pop('method', 'anderson')
+max_iter = cfg.pop('max_iter', ...)
+tol = cfg.pop('tol', ...)
+fwd_kwargs = {k: cfg[k] for k in ('m', 'lam', 'beta') if k in cfg}
 with torch.no_grad():
-    v_star, info = anderson(lambda v: rhs_fn(v, u), v0,
-                            max_iter=max_iter, tol=tol, **fwd_kwargs)
+    if method == 'anderson':
+        v_star, info = anderson(lambda v: rhs_fn(v, u), v0,
+                                max_iter=max_iter, tol=tol, **fwd_kwargs)
+    else:
+        v_star, info = fixed_point(lambda v: rhs_fn(v, u), v0,
+                                   max_iter=max_iter, tol=tol)
 ctx.rhs_fn = rhs_fn
 ctx.v_star = v_star
 ctx.u = u
-return v_star.detach().requires_grad_(True)
+EquilibriumSolve.last_info = info
+return v_star  # plain tensor; no dead detach/requires_grad_ trick
 ```
+
+Note the config keys read here are `m`, `lam`, `beta` — the YAML
+`anderson_m` key is NOT consumed by the solver (it uses the Anderson
+default `m=5`).
 
 **Backward** (`EquilibriumSolve.backward`):
 
 ```python
 # Solve J^T y = grad_out for y
-y = solve_jacobian_transpose(f_at_v_only, v_star, grad_out,
-                              tol=backward_tol, max_iter=backward_max_iter)
-y = -y  # sign convention: f_.backward(-y) below
+y_flat = solve_jacobian_transpose(f_at_v_only, v_star, grad_out,
+                                  tol=backward_tol, max_iter=backward_max_iter)
+y = (-y_flat).view_as(grad_out)  # sign convention: f_.backward(-y) below
 
 # Re-run residual under enable_grad, populate parameter grads
 v_ = v_star.detach().requires_grad_(True)
 u_ = u.detach().requires_grad_(True)  # if u exists
 with torch.enable_grad():
     f_ = rhs_fn(v_, u_)
-f_.backward(gradient=y)               # populates .grad on v_, u_, and all
-                                      # network parameters via autograd chain
+f_.backward(gradient=y, retain_graph=True)   # populates .grad on v_, u_, and
+                                             # all network parameters via
+                                             # autograd chain
 return (None, None, u_.grad, None)    # grads w.r.t. rhs_fn, v0, u, cfg
 ```
 
-Key detail: `v_` and `u_` are re-computed with `detach` + `requires_grad_`,
-not reused from the forward pass.  This ensures the forward solver graph is
-never retained.
+Key details:
+- `v_` and `u_` are re-computed with `detach` + `requires_grad_`, not
+  reused from the forward pass.  This ensures the forward solver graph is
+  never retained.
+- `retain_graph=True` is passed so the same `f_` graph can be backpropagated
+  against both `v_` and `u_`.
+- `backward_mode: phantom` short-circuits `solve_jacobian_transpose` with the
+  cheap fixed-point iterate of §4.4 (biased but stable gradient).
 
 ### 4.3  solve_jacobian_transpose (matrix-free Jᵀ solve)
 
@@ -477,6 +511,91 @@ without per-sample overhead.  Selectable via `--batch_only`; artifacts
 written to `results/rls_demo/batch_metrics.json` and `batch_solutions.npz`.
 Regression tests live in `src/tests/test_batch_rls.py`.
 
+### 5.4  Circuit-stamp backend for weighted-Gram IRLS
+
+The dense affine residual `f(w) = p - Rw` (used by `LinearSolveLayer`)
+is mathematically identical to an element-level KCL residual
+
+```text
+f(w) = X^T [v * (y - X w)] - delta * w,
+```
+
+distributed across three physical primitives in `utils/circuit_stamp.py`:
+
+| Optimization quantity | Circuit interpretation |
+|---|---|
+| `w_i` | Voltage on tap node `i` |
+| `x_t^T w` | Output of sample `t`'s signed transformer bank |
+| `y_t` | Branch reference/source voltage |
+| `q_t = x_t^T w - y_t` | Sample branch voltage drop |
+| `v_t` | Positive conductance of sample branch |
+| `i_t = v_t q_t` | Branch current |
+| `-X^T i` | Current injected into tap nodes (transformer transpose) |
+| `delta * w` | Tap-node shunt leakage to ground |
+| `X^T diag(v) X + delta I` | Nodal stiffness / conductance matrix |
+
+`TransformerConductanceBank` (`circuit_stamp.py:96`) computes the KCL
+injection; `LeakageToGround` (`circuit_stamp.py:170`) computes the shunt
+leakage; `WeightedGramCircuitLayer.rhs` (`circuit_stamp.py:212`) sums
+them.  `WeightedGramCircuitSolve` (`circuit_stamp.py:271`) wraps the
+residual in `EquilibriumSolve.apply`, passing `conductance` as the
+**explicit** `u` argument (not closure-captured) so the weighter's
+gradient flows back through `EquilibriumSolve.backward`.
+
+The forward path never forms `R = X^T diag(v) X + delta I`.  It only
+forms the per-sample branch drops, branch currents, the
+transformer-transpose injection, and the per-tap shunt leakages.
+These are algebraically identical to `p - Rw` to float-rounding
+(`test_weighted_gram_circuit.py:Gate 1`, max abs diff `~1.7e-15`).
+
+The solver step size is computed from `R`'s spectrum under
+`torch.no_grad()` (one-time `O(d^3)` cost per IRLS round).  This is
+consistent with the dense backend's `_chebyshev_beta` policy in
+`block_robust_rls`.  A conservative upper-bound step
+(`conservative_beta=True`) avoids `eigvalsh` for large `d`:
+
+```text
+beta = 2 / (delta + (delta + sum_t v_t ||x_t||^2))
+```
+
+Block IRLS selects the backend via `backend='dense' | 'circuit_stamp'`
+on `block_robust_rls` (default `'dense'`, backward-compatible).  The
+demo CLI exposes `--block_solver_backend`.  All 9 gates in
+`test_weighted_gram_circuit.py` pass in float64 CPU:
+
+```text
+Gate 1 element == dense         : max abs diff = 1.776e-15
+Gate 2 energy-gradient          : |f + grad E| = 0.000e+00
+Gate 3 Jacobian sym/NSD         : -J SPD, lambda_min(-J) >= delta
+Gate 4 solve parity             : rel(circuit - direct) = 4.056e-13
+Gate 5 v=1 circuit parity       : rel(circuit - plain-ridge) = 6.495e-14
+Gate 6 multi-round IRLS         : rel(w) <= 1e-15 for K in {0,1,4,8}
+Gate 7 weighter grad            : rel(circuit vs dense) <= 5e-14
+Gate 8 FD gradcheck             : rel(implicit vs FD) = 5.9e-08
+Gate 9 invalid input            : negative v, bad delta, bad shapes rejected
+```
+
+**Hardware-model limitations** (explicitly stated, do not over-claim):
+
+* A generic dense signed regression matrix `X` is **not** realizable
+  as a passive two-terminal resistor graph.  Each row `x_t^T` couples
+  to all `d` tap voltages with arbitrary signs, which exceeds what an
+  edge in the current `CircuitLayer` topology (a voltage difference
+  between two nodes) can represent.
+
+* The accepted realization is the **ideal signed transformer /
+  conductance multiport network**: per-sample signed coupling to every
+  tap through an ideal transformer, followed by a per-sample positive
+  conductance `v_t`, in series with a branch voltage source `y_t`,
+  with tap-node shunt leakages `delta` closing KCL at the d taps.
+
+* The following nonideal physics are **deferred** to a later
+  hardware-fidelity phase (and must not appear in any parity claim):
+  finite wire resistance / IR drop, finite conductance range, DAC/ADC
+  quantization, device mismatch, nonlinear I-V curves, transformer
+  loss, differential-pair mismatch, parasitic capacitance / transient
+  ODE simulation.  See `docs/weighted_gram_circuit.md` §4.
+
 ---
 
 ## 6. Training Pipeline (`main_deq.py`)
@@ -631,14 +750,15 @@ gradient at negligible cost.  Used by the MNIST config.
 
 ## 8. Test Results
 
-All 32 tests pass on CPU (`seed=42`).
+All 40 tests pass on CPU (`seed=42`) via `tests/run_all.py`:
+8 solver + 8 device + 6 RHS + 7 equilibrium + 3 end-to-end + 8 batch RLS.
 
 ### 8.1  Solver tests (8 tests)
 
-- Anderson converges to `torch.linalg.solve` reference with error `1.1e-7`.
+- Anderson converges to `torch.linalg.solve` reference with error `1.4e-7`.
 - Fixed-point converges with error `1.7e-7` (5000 iter, strict tol).
 - Unique attractor: 5 random initializations converge to same equilibrium
-  (spread `2.7e-8`).
+  (spread `5.0e-8`).
 - `solve_jacobian_transpose` returns `A⁻¹ rhs` with error `4.8e-7` for n=4.
 - Contraction certificate: passive `λ_max=-1.0` (margin `1.0`).
 - Zero-gamma chain graph correctly not certified passive (`λ_max≈0`).
@@ -676,14 +796,14 @@ All 32 tests pass on CPU (`seed=42`).
 ### 8.5  End-to-end tests (3 tests)
 
 - Forward shape: `(4, 1) → (4, 1)`.
-- Training: loss decreases over 5 steps (`0.33 → 0.33` — MSE on random data).
+- Training: loss decreases over 5 steps (`0.334 → 0.331` — MSE on random data).
 - Solver stats logged with `n_iter > 0`.
 
 ### 8.6  Smoke training (toyregress)
 
 | Config | Params | Train loss | Test loss | Solver | Certificate |
 |--------|--------|-----------|----------|--------|-------------|
-| 1-layer (6 nodes, 240 edges) | 0.96 KiB | 0.124 → 0.021 (5 ep) | 0.019 | Layer 0 converges in 25-60 iter (residual ~1e-5) ✓ | passive (λ_max=-40.9) |
+| 1-layer (6 nodes, 240 edges) | 0.25 KiB | 0.124 → 0.021 (5 ep) | 0.019 | Layer 0 converges in 25-60 iter (residual ~1e-5) ✓ | passive (λ_max=-40.9) |
 | 2-layer (2×6 nodes, 480 edges) | 0.96 KiB | 0.186 → 0.030 (5 ep) | 0.028 | Layer 0 converges ✓; Layer 1 hits 60-iter limit (residual ~6e-4, above tol=1e-5) ✗ | passive (λ_max=-40.9) |
 
 No NaN/Inf, no CG failures.
@@ -695,6 +815,43 @@ No NaN/Inf, no CG failures.
 | 2-layer toyregress `[4,4],[4,4]` (60 iter, tol=1e-5) | Layer 0 ✓, Layer 1 ✗ | Layer 1 stalls at ~6e-4 (60× above tol). Training improves anyway because gradients from near-equilibrium are still useful. Likely need more iterations, smaller β, or fused-mode settling. |
 | twomoon `[4,4],[4,4]` (80 iter, tol=1e-5) | ❓ Not run | — |
 | MNIST `[_mix_connect]*2` (40 iter, tol=1e-4) | ❓ Not run | — |
+
+### 8.7  Batch RLS tests (8 tests, `test_batch_rls.py`)
+
+- `FabricBatchRLS` forward shape and batched normal-equation construction.
+- Batch solve matches closed-form `(R⁻¹ Bᵀ y)` reference.
+- RLS streaming (`FabricRLS`) vs batch (`FabricBatchRLS`) agree on identical
+  data after sufficient samples.
+- Regularization budget (`R0 = delta·I`) shapes the solution.
+- All 8 pass on CPU (`seed=42`).
+
+### 8.8  Weighted-Gram circuit-stamp tests (10 gates, `test_weighted_gram_circuit.py`)
+
+Standalone suite (not yet registered in `run_all.py` per the design-note
+"Gates 1-3 first" discipline).  All 9 gates + the certificate bonus pass
+on float64 CPU:
+
+- **Gate 1 element == dense**: max abs diff = `1.78e-15` (signed `X`,
+  per-tap `v > 0`, `d=8`, `T=32`).
+- **Gate 2 energy-gradient identity**: `|f + grad E| = 0` exactly.
+- **Gate 3 Jacobian symmetry and NSD**: `|J - J^T| = 2.22e-16`,
+  `lambda_min(-J) >= delta`.
+- **Gate 4 solve parity**: `rel(circuit - direct) = 4.06e-13`.
+- **Gate 5 v = 1 circuit parity**: `rel(circuit - plain-ridge) = 6.50e-14`.
+- **Gate 6 multi-round IRLS**: `rel(w) <= 1e-15` for `K in {0, 1, 4, 8}`
+  between dense and circuit backends.
+- **Gate 7 weighter gradient parity**: `rel(raw_c) = 8.76e-15`,
+  `rel(raw_alpha) = 4.60e-14`.
+- **Gate 8 FD gradcheck**: `rel(implicit - FD) = 5.93e-08` on `raw_c`.
+- **Gate 9 invalid input**: negative `v`, `delta <= 0`, shape mismatches
+  rejected; non-finite inputs propagate; `validate_nonneg=False` is the
+  production fast path.
+
+The dense and circuit-stamp backends produce bit-equivalent `c` and
+`alpha` trajectories in the small-scale grid sweep (`d=4, N=64, K=4,
+80 epochs`):
+trained `c = 0.0641, alpha = 0.1917` in both backends,
+trained loss `8.054e-3` in both.
 
 ---
 
@@ -710,12 +867,14 @@ implemented, it should:
 - Build merged `Γ`, `S`, `input_map`.
 - Add `mode: fused` branch to `EquilibriumBlock.__init__` and `forward`.
 
-### 9.2  Inter-layer gradient flow (medium priority)
+### 9.2  Inter-layer gradient flow (medium priority) — DONE (v1)
 
-Currently only the last layer's parameters receive gradients in composed mode
-(because every layer sees the same `u` while the chain-of-equilibria is broken).
-The v2 design feeds `v_{k-1}^*` as the `u` argument of layer `k` (not just
-warm-start init), making the autograd chain differentiable across layers.
+**Implemented.** `EquilibriumBlock.forward` now feeds `v_{k-1}^*` (previous
+layer's equilibrium) as the `u` argument of layer `k` (not just warm-start
+init), making the autograd chain differentiable across layers.  Guarded by
+`test_multi_layer_grad_flows_to_earlier_layers` (passing).  A v2 refinement
+(coupling edges between layers via `merge_topologies`) remains, tracked by
+9.1.
 
 ### 9.3  Streaming RLS demo (medium priority)
 
@@ -791,13 +950,18 @@ through.  Either remove it from the signature or use it.
 ## 10. Reproducing Tests and Training
 
 ```bash
-# Run all 32 tests
+# Run all 40 tests (8+8+6+7+3+8)
 cd src && python tests/run_all.py
 
 # Run individual test modules
 cd src && python tests/test_deq_solver.py
 cd src && python tests/test_equilibrium_solve.py
 cd src && python tests/test_deq_end_to_end.py
+
+# Standalone circuit-stamp gate suite (9 + certificate, float64 CPU).
+# Not registered in run_all.py per the design-note "Gates 1-3 first"
+# discipline; run directly:
+cd src && python tests/test_weighted_gram_circuit.py
 
 # Train toyregress (1-layer or 2-layer)
 cd src && python main_deq.py \
@@ -813,4 +977,18 @@ cd src && python main_deq.py \
 cd src && python main_deq.py \
     --config_path configs/config_deq_mnist.yaml \
     --exp_name mnist --gpu -1
+```
+
+### 10.1  Block IRLS with circuit-stamp backend
+
+```bash
+# Dense backend (default, backward-compatible):
+cd src && python run_rls_demo.py --train_robust_block \
+    --block_N 512 --block_K 8 --block_delta 1e-2 --block_epochs 80
+
+# Circuit-stamp backend (element-level KCL residual; algebraically
+# identical to dense for the weighted-Gram IRLS objective):
+cd src && python run_rls_demo.py --train_robust_block \
+    --block_solver_backend circuit_stamp \
+    --block_N 512 --block_K 8 --block_delta 1e-2 --block_epochs 80
 ```

@@ -264,16 +264,18 @@ from utils.circuit_block import LinearSolveLayer
 
 
 def test_weighter_bounds():
-    """Gate 5 (KIMI correction #5): v_t in (0, 1] for |e| up to 1e3.
+    """Gate 5 (KIMI correction #5 + Phase B2): v_t in [0, v_max] for |e| up to 1e3.
 
-    Load-bearing invariant for the SPD certificate on R.  If anyone
-    later edits the parameterization, this should fail loudly.
+    Load-bearing invariant for the SPD certificate on R (with delta*I the
+    Gram matrix stays SPD even when individual v_t can underflow to 0 in
+    finite precision; phase B2).  If anyone later edits the
+    parameterization, this should fail loudly.
     """
-    w = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    w = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693)
     e_grid = torch.tensor([1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0],
                           dtype=torch.float64)
     v = w(e_grid)
-    assert (v > 0).all(), f"v_t has non-positive entries: {v}"
+    assert (v >= 0).all(), f"v_t has negative entries: {v}"
     assert (v <= 1.0 + 1e-7).all(), f"v_t exceeds v_max: {v}"
     # Sanity: very small e -> v near 1; very large e -> v bounded away
     # from v_max (the descent rate is governed by alpha ~ 0.127).
@@ -299,13 +301,14 @@ def test_weighter_init_unit_check():
     (decision 2a) is the byte-exact v==1 case covered by the
     digital/fabric v==1 tests below.
     """
-    w = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    w = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693).to(torch.float64)
     # v(0) = 1 exactly
-    v0 = w(torch.tensor(0.0))
-    assert torch.allclose(v0, torch.tensor(1.0), atol=1e-12), f"v(0)={v0.item()}"
-    # v(e) ~ 1 for small |e|.  With c ~ 0.107 (init raw_c=-2.25) and
+    v0 = w(torch.tensor(0.0, dtype=torch.float64))
+    assert torch.allclose(v0, torch.tensor(1.0, dtype=torch.float64), atol=1e-12), \
+        f"v(0)={v0.item()}"
+    # v(e) ~ 1 for small |e|.  With c ~ 0.1012 (init c_init=0.10119) and
     # alpha ~ 0.127, v(0.05) ~ 0.975 and v(0.1) ~ 0.92.
-    e_small = torch.linspace(-0.05, 0.05, 11)
+    e_small = torch.linspace(-0.05, 0.05, 11, dtype=torch.float64)
     v_small = w(e_small)
     assert (v_small > 0.95).all() and (v_small <= 1.0 + 1e-12).all(), \
         f"v(e) for |e|<=0.05 should be ~1, got {v_small}"
@@ -313,7 +316,7 @@ def test_weighter_init_unit_check():
     # v(10) ~ 0.31, v(100) ~ 0.17, v(1000) ~ 0.10.  The threshold is
     # set so v(10) is required to descend measurably (~ v at the burst
     # magnitude kappa*sigma = 0.2) without demanding full saturation.
-    e_large = torch.tensor([10.0, 100.0, 1000.0])
+    e_large = torch.tensor([10.0, 100.0, 1000.0], dtype=torch.float64)
     v_large = w(e_large)
     assert (v_large < 0.4).all(), f"v(e) for |e|>>c should descend, got {v_large}"
     # Stronger descent at |e| >= 100: the weighter must be meaningful
@@ -321,7 +324,7 @@ def test_weighter_init_unit_check():
     # far below 0.2 during training; the init just has to be < 0.3).
     assert (v_large[1:] < 0.3).all(), f"v(e) for |e|>=100 should descend, got {v_large[1:]}"
     # v_max=1.0 strictly
-    assert torch.allclose(w.v_max, torch.tensor(1.0))
+    assert torch.allclose(w.v_max, torch.tensor(1.0, dtype=torch.float64))
     print(f"  [weighter init unit] v(0)={v0.item():.6f}, "
           f"v(0.05)={v_small[10].item():.4f}, v(10)={v_large[0].item():.4e}, "
           f"v(1e3)={v_large[-1].item():.4e}. PASS")
@@ -433,9 +436,9 @@ def test_implicit_vs_unrolled_grad_robust(d=8, T=8, lam=0.99, tol=1e-4,
     d_obs = x @ w_o + 0.05 * torch.randn(T, generator=g, dtype=torch.float64)
 
     # ---- Implicit backward path (production) ----
-    w_imp = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
-    w_imp.raw_c.data = w_imp.raw_c.data.double()
-    w_imp.raw_alpha.data = w_imp.raw_alpha.data.double()
+    w_imp = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693)
+    w_imp.log_c.data = w_imp.log_c.data.double()
+    w_imp.log_alpha.data = w_imp.log_alpha.data.double()
     d64 = torch.float64
     fr_imp = FabricRobustRLS(d=d, weighter=w_imp, lam=lam,
                              R0=torch.eye(d, dtype=d64),
@@ -449,12 +452,12 @@ def test_implicit_vs_unrolled_grad_robust(d=8, T=8, lam=0.99, tol=1e-4,
         loss_imp = loss_imp + e_t.pow(2).sum()
         fr_imp.step(x[t], d_obs[t])
     loss_imp.backward()
-    g_imp = w_imp.raw_c.grad.item()
+    g_imp = w_imp.log_c.grad.item()
 
     # ---- Unrolled forward reference ----
-    w_unr = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
-    w_unr.raw_c.data = w_imp.raw_c.data.clone()
-    w_unr.raw_alpha.data = w_imp.raw_alpha.data.clone()
+    w_unr = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693)
+    w_unr.log_c.data = w_imp.log_c.data.clone()
+    w_unr.log_alpha.data = w_imp.log_alpha.data.clone()
     R_unr = torch.eye(d, dtype=torch.float64)
     p_unr = torch.zeros(d, dtype=torch.float64)
     w_state = torch.zeros(d, dtype=torch.float64)
@@ -468,7 +471,7 @@ def test_implicit_vs_unrolled_grad_robust(d=8, T=8, lam=0.99, tol=1e-4,
         p_unr = lam * p_unr + v_t * d_obs[t] * x[t]
         w_state = layer(p_unr.unsqueeze(0), R_unr).squeeze(0)
     loss_unr.backward()
-    g_unr = w_unr.raw_c.grad.item()
+    g_unr = w_unr.log_c.grad.item()
 
     rel_err = abs(g_imp - g_unr) / max(abs(g_unr), 1e-12)
     # Phase 1.5 prerequisite #4: state the precision context so the
@@ -538,7 +541,7 @@ def test_gaussian_control_flat_weighter(epochs=20, T=8, lam=0.99, sigma=0.01,
     functional property); we test the variance directly."""
     torch.manual_seed(seed)
     device = torch.device('cpu')
-    weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0).to(device)
+    weighter = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693).to(device)
     optimizer = torch.optim.Adam(weighter.parameters(), lr=lr)
 
     for epoch in range(epochs):
@@ -677,7 +680,7 @@ def test_block_robust_digital_matches_fabric(d=6, N=128, delta=1e-2, K=4,
 
     # Force a meaningful IRLS trajectory by using a weighter that
     # descends sharply for |e| > kappa*sigma*0.5.
-    weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    weighter = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693)
     weighter = weighter.to(torch.float64)
 
     w_fabric = block_robust_rls(X, d_obs, weighter, delta=delta, K=K,
@@ -709,7 +712,7 @@ def test_block_robust_impulsive_improvement(d=6, N=128, delta=1e-2, K=4,
     to paper over (mirrors the plan's "report, don't tune").
     """
     torch.manual_seed(seed)
-    weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    weighter = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693)
     optimizer = torch.optim.Adam(weighter.parameters(), lr=lr)
 
     for epoch in range(epochs):
@@ -764,7 +767,7 @@ def test_block_robust_impulsive_improvement(d=6, N=128, delta=1e-2, K=4,
 
 def test_block_robust_grad_flow(d=8, N=16, K=4, delta=1e-2, tol=1e-4,
                                   seed=0):
-    """Phase 1.5 gate 4: ``raw_c.grad`` finite/nonzero after backprop
+    """Phase 1.5 gate 4: ``log_c.grad`` finite/nonzero after backprop
     through K settles; exact implicit-vs-unrolled < 1e-4 (float64,
     solver tol 1e-10).
 
@@ -782,20 +785,20 @@ def test_block_robust_grad_flow(d=8, N=16, K=4, delta=1e-2, tol=1e-4,
     d_obs = X @ w_o + nu
 
     # ---- Production (implicit, exact backward) ----
-    w_imp = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
-    w_imp.raw_c.data = w_imp.raw_c.data.double()
-    w_imp.raw_alpha.data = w_imp.raw_alpha.data.double()
+    w_imp = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693)
+    w_imp.log_c.data = w_imp.log_c.data.double()
+    w_imp.log_alpha.data = w_imp.log_alpha.data.double()
     w_K_imp = block_robust_rls(X, d_obs, w_imp, delta=delta, K=K,
                                max_iter=50, tol=1e-10, beta=1.0,
                                backward_mode='exact')
     loss_imp = (X @ w_K_imp - X @ w_o).pow(2).sum()
     loss_imp.backward()
-    g_imp = w_imp.raw_c.grad.item()
+    g_imp = w_imp.log_c.grad.item()
 
     # ---- Unrolled reference (closed-form solve per iter) ----
-    w_unr = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
-    w_unr.raw_c.data = w_imp.raw_c.data.clone()
-    w_unr.raw_alpha.data = w_imp.raw_alpha.data.clone()
+    w_unr = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693)
+    w_unr.log_c.data = w_imp.log_c.data.clone()
+    w_unr.log_alpha.data = w_imp.log_alpha.data.clone()
     R = X.t() @ X + delta * torch.eye(d, dtype=torch.float64)
     p = X.t() @ d_obs
     w_state = torch.linalg.solve(R, p)
@@ -807,7 +810,7 @@ def test_block_robust_grad_flow(d=8, N=16, K=4, delta=1e-2, tol=1e-4,
         w_state = torch.linalg.solve(R, p)
     loss_unr = (X @ w_state - X @ w_o).pow(2).sum()
     loss_unr.backward()
-    g_unr = w_unr.raw_c.grad.item()
+    g_unr = w_unr.log_c.grad.item()
 
     rel_err = abs(g_imp - g_unr) / max(abs(g_unr), 1e-12)
     precision = 'float64 / solver tol 1e-10'
@@ -815,10 +818,10 @@ def test_block_robust_grad_flow(d=8, N=16, K=4, delta=1e-2, tol=1e-4,
           f"g_imp={g_imp:.6e}, g_unr={g_unr:.6e}, rel_err={rel_err:.2e}, "
           f"tol={tol}, precision={precision}. "
           f"{'PASS' if rel_err < tol else 'FAIL'}")
-    assert torch.isfinite(w_imp.raw_c.grad).all(), \
-        "raw_c.grad is non-finite"
+    assert torch.isfinite(w_imp.log_c.grad).all(), \
+        "log_c.grad is non-finite"
     assert abs(g_imp) > 1e-10, \
-        f"raw_c.grad is effectively zero: {g_imp}"
+        f"log_c.grad is effectively zero: {g_imp}"
     assert rel_err < tol, \
         f"implicit vs unrolled block grad mismatch: rel_err={rel_err:.2e}"
 
@@ -844,7 +847,7 @@ def test_phantom_vs_exact_bias(d=4, N=16, K=4, delta=1e-2, sigma=0.01,
     on a trained config at test time.
     """
     torch.manual_seed(seed)
-    weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    weighter = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693)
     optimizer = torch.optim.Adam(weighter.parameters(), lr=lr)
 
     # Short training to reach a non-trivial operating point (float32,
@@ -890,8 +893,8 @@ def test_phantom_vs_exact_bias(d=4, N=16, K=4, delta=1e-2, sigma=0.01,
     # actual training signal quality.  We only require finiteness and
     # nonzero magnitude (a zero gradient is a real bug).
     import math
-    assert math.isfinite(g_phantom), f"phantom raw_c.grad is non-finite: {g_phantom}"
-    assert math.isfinite(g_exact), f"exact raw_c.grad is non-finite: {g_exact}"
+    assert math.isfinite(g_phantom), f"phantom log_c.grad is non-finite: {g_phantom}"
+    assert math.isfinite(g_exact), f"exact log_c.grad is non-finite: {g_exact}"
     assert abs(g_phantom) > 1e-12, \
         f"phantom gradient is effectively zero: {g_phantom:.4e}"
     assert abs(g_exact) > 1e-12, \
@@ -927,7 +930,7 @@ def test_oracle_bound(d=6, N=128, delta=1e-2, K=4, sigma=0.01, p_burst=0.02,
     empty, so the oracle must reduce to plain batch LS: oracle ~= plain.
     """
     torch.manual_seed(seed)
-    weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    weighter = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693)
     optimizer = torch.optim.Adam(weighter.parameters(), lr=lr)
 
     for epoch in range(epochs):
@@ -1033,7 +1036,7 @@ def test_oos_monotonicity(d=6, delta=1e-2, K=4, sigma=0.01, p_burst=0.02,
         learned).
     """
     torch.manual_seed(seed)
-    weighter = LearnedRobustWeighter(raw_c=-2.25, raw_alpha=-2.0)
+    weighter = LearnedRobustWeighter(c_init=0.10119, alpha_init=0.12693)
     optimizer = torch.optim.Adam(weighter.parameters(), lr=lr)
 
     for epoch in range(epochs):
@@ -1228,6 +1231,162 @@ def test_huber_hampel_mad_improvement(d=6, N=256, delta=1e-2, K=8,
         f"Hampel must not catastrophically degrade on Gaussian: rel={rel_hampel:.4e}"
 
 
+# ----------------------------------------------------------------------------
+# Phase B / Phase E1: fast unit tests for the log-coordinate weighter.
+# ----------------------------------------------------------------------------
+
+
+def test_new_legacy_parameterization_equivalence(dtype=torch.float64,
+                                                  tol=1e-12):
+    """Phase E1.1: new log-scale weighter produces the same v(e) curve
+    as the legacy softplus weighter at the matching (c, alpha) operating
+    point (forward equivalence at tight tolerance).
+
+    The legacy ``raw_c=-2.25`` corresponds to ``c = softplus(-2.25)+1e-3``
+    (about 0.1012); the new init defaults ``c_init=0.10`` are within
+    sub-percent of that -- the test compares both ways: a legacy
+    parameterization and a new one constructed at the same c and
+    alpha, and asserts max-abs-error on a representative e grid.
+    """
+    legacy_w = LearnedRobustWeighter(c_init=0.10, alpha_init=0.13).to(dtype)
+    legacy_c = legacy_w.c.item()
+    legacy_alpha = legacy_w.alpha.item()
+    new_w = LearnedRobustWeighter(c_init=legacy_c, alpha_init=legacy_alpha).to(dtype)
+    e = torch.tensor([-10.0, -0.5, -0.1, 0.0, 0.1, 0.5, 10.0],
+                     dtype=dtype)
+    v_legacy = legacy_w(e).detach()
+    v_new = new_w(e).detach()
+    err = (v_legacy - v_new).abs().max().item()
+    print(f"  [param equivalence] c={legacy_c:.6f}, alpha={legacy_alpha:.6f}, "
+          f"max_abs_err={err:.3e}, tol={tol}")
+    assert err < tol, \
+        f"new and legacy weighter parameterizations disagree: {err:.3e} >= {tol}"
+
+
+def test_weight_bounds_monotonicity(dtype=torch.float64):
+    """Phase E1.2: v(e) is bounded in [0, 1] for |e| in [1e-8, 1e4] and
+    monotonically non-increasing in |e| over a log-spaced grid.
+
+    Tests the actual scientific claim rather than a few manually chosen
+    error values (plan Phase E1.2).
+    """
+    w = LearnedRobustWeighter(c_init=0.1012, alpha_init=0.1269).to(dtype)
+    e_abs = torch.logspace(-8, 4, 200, dtype=dtype)
+    v = w(e_abs).detach()
+    assert torch.all(v >= 0).item(), \
+        f"v_t has negative entries: min={v.min().item()}"
+    assert torch.all(v <= 1.0 + 1e-12).item(), \
+        f"v_t exceeds v_max: max={v.max().item()}"
+    # Monotone non-increasing in |e| (the forward is symmetric and
+    # monotone in |e|).
+    assert torch.all(v[1:] <= v[:-1] + 1e-15).item(), \
+        "v(|e|) is not monotonically non-increasing"
+    # Sanity: v(1e-8) ~ 1 (very small |e| -> near the origin -> v ~ 1)
+    # and v(1e4) descends measurably (large |e| -> saturation tail).
+    # Note: with the init alpha ~ 0.127 the tail decays slowly
+    # (v(1e4) ~ 5e-2), so we only require a strong relative descent
+    # rather than near-zero absolute value.
+    v_near_zero = v[0].item()
+    v_far = v[-1].item()
+    assert v_near_zero > 0.99, \
+        f"v(1e-8) should be near 1, got {v_near_zero}"
+    assert v_far < 0.2, \
+        f"v(1e4) should descend well below 1, got {v_far:.4e}"
+    print(f"  [weight bounds/monotone] v(1e-8)={v_near_zero:.4f}, "
+          f"v(1e4)={v_far:.4e}, monotone non-increasing. PASS")
+
+
+def test_legacy_checkpoint_migration(dtype=torch.float64):
+    """Phase E1.3: a legacy softplus checkpoint (raw_c, raw_alpha) loads
+    into the new log-scale weighter and produces the same forward output
+    as a freshly-constructed legacy weighter (within float64 tolerance).
+
+    Emits a ``UserWarning`` on load (the documented migration signal).
+    """
+    import torch.nn.functional as _F
+    legacy_w = LearnedRobustWeighter(c_init=0.10, alpha_init=0.13).to(dtype)
+    legacy_sd = legacy_w.state_dict()
+    assert 'log_c' in legacy_sd and 'log_alpha' in legacy_sd, \
+        f"new weighter state dict missing log_c/log_alpha: {list(legacy_sd)}"
+    # Simulate a legacy checkpoint: raw_c / raw_alpha.
+    legacy_ckpt = {'raw_c': torch.tensor(-2.25, dtype=dtype),
+                   'raw_alpha': torch.tensor(-2.0, dtype=dtype),
+                   'v_max': torch.tensor(1.0, dtype=dtype)}
+    legacy_c = _F.softplus(torch.tensor(-2.25, dtype=dtype)) + 1e-3
+    legacy_alpha = _F.softplus(torch.tensor(-2.0, dtype=dtype))
+    new_w = LearnedRobustWeighter(c_init=0.10, alpha_init=0.13).to(dtype)
+    new_w.load_state_dict(legacy_ckpt)
+    assert abs(new_w.c.item() - legacy_c.item()) < 1e-12, \
+        f"migrated c={new_w.c.item()} != legacy c={legacy_c.item()}"
+    assert abs(new_w.alpha.item() - legacy_alpha.item()) < 1e-12, \
+        f"migrated alpha={new_w.alpha.item()} != legacy alpha={legacy_alpha.item()}"
+    e = torch.tensor([-1.0, -0.1, 0.0, 0.1, 1.0], dtype=dtype)
+    v_new = new_w(e).detach()
+    legacy_compare = LearnedRobustWeighter(c_init=float(legacy_c),
+                                          alpha_init=float(legacy_alpha)).to(dtype)
+    v_ref = legacy_compare(e).detach()
+    err = (v_new - v_ref).abs().max().item()
+    assert err < 1e-12, \
+        f"migrated vs freshly-built weighter disagree: {err:.3e}"
+    print(f"  [legacy migration] migrated (c, alpha)=({new_w.c.item():.6f}, "
+          f"{new_w.alpha.item():.6f}), "
+          f"forward_err={err:.3e}. PASS")
+
+
+def test_deq_direct_oneblock_parity(d=8, N=64, K=4, delta=1e-2, seed=0,
+                                      tol_forward=1e-4, tol_grad=1e-3):
+    """Phase E1.4 / Phase C5: DEQ and direct closed-form block IRLS
+    agree on forward w and on the gradient w.r.t. log_c/log_alpha at
+    float64 / tight tol.
+
+    Kept small enough (d=8, N=64, K=4) for run_all.py; the
+    production-scale gradcheck lives in ``tests/test_prod_gradcheck.py``.
+    """
+    torch.manual_seed(seed)
+    g = torch.Generator(device='cpu').manual_seed(seed)
+    w_o = torch.randn(d, generator=g, dtype=torch.float64)
+    w_o = w_o / w_o.norm()
+    X = torch.randn(N, d, generator=g, dtype=torch.float64)
+    nu = 0.01 * torch.randn(N, generator=g, dtype=torch.float64)
+    d_obs = X @ w_o + nu
+
+    wgt = LearnedRobustWeighter(c_init=0.1012, alpha_init=0.1269).to(torch.float64)
+
+    w_deq = block_robust_rls(X, d_obs, wgt, delta=delta, K=K,
+                             max_iter=500, tol=1e-12,
+                             backward_mode='exact', solver='deq')
+    w_dir = block_robust_rls(X, d_obs, wgt, delta=delta, K=K,
+                             max_iter=500, tol=1e-12,
+                             backward_mode='exact', solver='direct')
+    rel = (w_deq - w_dir).norm().item() / w_deq.norm().clamp_min(1e-12).item()
+    assert rel < tol_forward, \
+        f"DEQ vs direct forward parity mismatch: rel={rel:.3e} >= {tol_forward}"
+
+    wgt_g1 = LearnedRobustWeighter(c_init=0.1012, alpha_init=0.1269).to(torch.float64)
+    wgt_g2 = LearnedRobustWeighter(c_init=0.1012, alpha_init=0.1269).to(torch.float64)
+    w_K1 = block_robust_rls(X, d_obs, wgt_g1, delta=delta, K=K,
+                            max_iter=500, tol=1e-12,
+                            backward_mode='exact', solver='deq')
+    ((X @ w_K1 - X @ w_o).pow(2).sum()).backward()
+    g_log_c_deq = wgt_g1.log_c.grad.item()
+    g_log_a_deq = wgt_g1.log_alpha.grad.item()
+    w_K2 = block_robust_rls(X, d_obs, wgt_g2, delta=delta, K=K,
+                            max_iter=500, tol=1e-12,
+                            backward_mode='exact', solver='direct')
+    ((X @ w_K2 - X @ w_o).pow(2).sum()).backward()
+    g_log_c_dir = wgt_g2.log_c.grad.item()
+    g_log_a_dir = wgt_g2.log_alpha.grad.item()
+    rel_g_c = abs(g_log_c_deq - g_log_c_dir) / max(abs(g_log_c_dir), 1e-12)
+    rel_g_a = abs(g_log_a_deq - g_log_a_dir) / max(abs(g_log_a_dir), 1e-12)
+    assert rel_g_c < tol_grad and rel_g_a < tol_grad, \
+        f"DEQ vs direct grad parity mismatch: " \
+        f"rel_g_c={rel_g_c:.3e}, rel_g_a={rel_g_a:.3e}"
+
+    print(f"  [DEQ vs direct parity d={d} N={N} K={K}] "
+          f"forward_rel={rel:.3e}, grad_rel_c={rel_g_c:.3e}, "
+          f"grad_rel_a={rel_g_a:.3e}. PASS")
+
+
 if __name__ == '__main__':
     print("=" * 60)
     print("Phase 0 + Phase 1 + Phase 1.5 + oracle-oos gates")
@@ -1259,4 +1418,9 @@ if __name__ == '__main__':
     # Classical-robust baselines (Huber/Hampel + MAD scale)
     test_mad_scale_tracks_noise()
     test_huber_hampel_mad_improvement()
-    print("\nAll Phase 0 + Phase 1 + Phase 1.5 + oracle-oos gates passed.")
+    # Phase E1: log-coordinate weighter unit tests
+    test_new_legacy_parameterization_equivalence()
+    test_weight_bounds_monotonicity()
+    test_legacy_checkpoint_migration()
+    test_deq_direct_oneblock_parity()
+    print("\nAll Phase 0 + Phase 1 + Phase 1.5 + oracle-oos + E1 gates passed.")

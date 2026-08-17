@@ -52,10 +52,13 @@ KIMI audit corrections applied:
       Anderson iters substantially (the fabric's w_t moves slowly
       between samples; see LinearSolveLayer.forward init= kwarg).
 """
+import math
 import sys
+import warnings
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from utils.circuit_block import LinearSolveLayer, EquilibriumSolve
 
@@ -94,48 +97,88 @@ DigitalRLS = _lookup_attr('DigitalRLS')
 
 
 class LearnedRobustWeighter(nn.Module):
-    """Per-sample robust influence v(e) in (0, 1].
+    """Per-sample robust influence v(e) in [0, v_max].
 
-    Parameterization (plan decision 1, KIMI correction #1):
+    Parameterization (Phase B / plan decision B1, ``log_exp_v1``):
 
-        c     = softplus(raw_c) + 1e-3          # > 1e-3 strictly
-        alpha = softplus(raw_alpha)            # > 0 strictly
-        v(e)  = v_max / (1 + (e/c)^2)^alpha
+        c     = exp(log_c)                              # > 0 strictly
+        alpha = exp(log_alpha)                          # > 0 strictly
+        v(e)  = v_max * exp(-alpha * log1p((e / c)^2))
 
-    Identity: v(0) = v_max = 1.  Descends toward 0 for |e| >> c.
+    Identity: v(0) = v_max.  Descends toward 0 for |e| >> c.
     Gaussian-control: alpha -> 0 collapses to v ~ v_max constant.
 
-    ``raw_c`` is initialized to -2.25 (c ~ 0.107) so the knee sits
-    between nominal errors (sigma ~ 0.01) and the impulsive burst
-    magnitude (kappa * sigma ~ 0.2).  ``raw_alpha`` is initialized to
-    -2.0 (alpha ~ 0.127) to match the plan's "alpha small, v_max near 1
-    near e ~ 0" init.
+    ``log_c`` and ``log_alpha`` are the trainable coordinates so a fixed
+    optimizer step changes c and alpha multiplicatively — appropriate
+    for quantities spanning orders of magnitude (alpha may traverse
+    0.13 to >= 1, potentially to > 20).  log1p-square is monotone and
+    non-negative; the entire expression is monotonic in both |e| and
+    alpha, so the local derivative scale at init matches the legacy
+    softplus parameterization to within a small constant.
+
+    Finite-precision positivity (plan B2): in float32,
+    ``alpha * log1p((e/c)^2)`` may underflow to ``-inf`` and ``exp`` to
+    zero; we clamp to ``[0, v_max]``.  The numerical statement is
+
+        0 <= v(e) <= v_max  in finite precision;
+        delta > 0  preserves R = X^T diag(v) X + delta I  SPD.
 
     The ``v_max`` cap is a fixed buffer in (0, 1] (not a learnable
-    parameter) so v_t > 0 strictly and R = lambda R + v_t xx^T stays
-    SPD with probability 1.
+    parameter) for backward compatibility with tests and scripts
+    that read ``weighter.v_max`` (e.g.
+    ``test_weighter_init_unit_check``).  Setting ``v_max`` away from 1
+    is allowed but only a constant multiplicative rescale of v(e).
+
+    Backward compatibility (plan B3):
+      * ``raw_c`` / ``raw_alpha`` keyword args are accepted as deprecated
+        legacy softplus coordinates and converted to ``log_c`` /
+        ``log_alpha`` (a one-shot ``UserWarning`` is emitted).  New code
+        should use ``c_init`` and ``alpha_init`` (the natural log-space
+        coordinates).
+      * ``load_state_dict`` migrates legacy checkpoints
+        (``raw_c`` / ``raw_alpha``) to the new coordinates with a
+        ``UserWarning`` and saves new checkpoints alongside the
+        parameterization tag ``"log_exp_v1"``.
     """
 
-    def __init__(self, raw_c=-2.25, raw_alpha=-2.0, v_max=1.0):
+    def __init__(self, c_init=0.10, alpha_init=0.13, raw_c=None,
+                 raw_alpha=None, v_max=1.0):
         super().__init__()
-        # Learned parameters (decision 1: raw_c, raw_alpha are learned).
-        self.raw_c = nn.Parameter(torch.tensor(float(raw_c)))
-        self.raw_alpha = nn.Parameter(torch.tensor(float(raw_alpha)))
+        if raw_c is not None or raw_alpha is not None:
+            warnings.warn(
+                "LearnedRobustWeighter: legacy raw_c/raw_alpha kwargs are "
+                "deprecated; pass c_init/alpha_init (log-space) instead. "
+                "Converting legacy softplus coords to log_c/log_alpha.",
+                UserWarning,
+            )
+            if raw_c is not None:
+                c_legacy = F.softplus(torch.tensor(float(raw_c))) + 1e-3
+                c_init = c_legacy.item()
+            if raw_alpha is not None:
+                a_legacy = F.softplus(torch.tensor(float(raw_alpha)))
+                alpha_init = a_legacy.item()
+        # Learned parameters in log-space (positive coordinates after
+        # exponentiation).  Init at float64 so a later ``.to(dtype)``
+        # preserves full precision (float32 init would round the value
+        # before any cast); default float32 training still works via
+        # ``.to(torch.float32)``.
+        self.log_c = nn.Parameter(torch.tensor(math.log(max(float(c_init), 1e-30)),
+                                               dtype=torch.float64))
+        self.log_alpha = nn.Parameter(torch.tensor(math.log(max(float(alpha_init), 1e-30)),
+                                                   dtype=torch.float64))
         # Fixed buffer (decision 1: v_max is fixed, not learned).
         self.register_buffer('v_max', torch.tensor(float(v_max)))
 
     @property
     def c(self):
-        # softplus(raw_c) + 1e-3 keeps c > 1e-3 strictly.
-        # softplus is monotone, so backprop is smooth and unconstrained.
-        return torch.nn.functional.softplus(self.raw_c) + 1e-3
+        return self.log_c.exp()
 
     @property
     def alpha(self):
-        return torch.nn.functional.softplus(self.raw_alpha)
+        return self.log_alpha.exp()
 
     def forward(self, e):
-        """Compute v(e) = v_max / (1 + (e/c)^2)^alpha.
+        """Compute v(e) = v_max * exp(-alpha * log1p((e/c)^2)).
 
         Parameters
         ----------
@@ -145,18 +188,65 @@ class LearnedRobustWeighter(nn.Module):
         Returns
         -------
         v_t : shape broadcastable to ``e``
-            Per-sample influence in (0, v_max] (strictly positive).
+            Per-sample influence in ``[0, v_max]`` (in finite precision).
+            Mathematically ``(0, v_max]``; underflows at saturation.
         """
         c = self.c
         alpha = self.alpha
-        ratio = e / c
-        denom = (1.0 + ratio * ratio).clamp_min(1e-30)
-        v = self.v_max / denom.pow(alpha)
-        # Numerical floor / ceiling: v_t must be in (0, v_max].
-        # softplus + clamping guarantees analytically, but rounding
-        # during the eigvalsh-adjacent matmuls can occasionally push
-        # the value slightly above v_max; clip defensively.
-        return v.clamp(min=1e-30, max=self.v_max)
+        log_term = torch.log1p((e / c).square())
+        v = self.v_max * torch.exp(-alpha * log_term)
+        # Numerical floor / ceiling: in float32, exp can underflow to
+        # exactly 0 for sufficiently large alpha*log_term; that is fine
+        # because delta*I keeps the Gram matrix strictly positive definite.
+        # Clip the rare fp-rounding over-vmax defensively.
+        return v.clamp(min=0.0, max=self.v_max)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Migrate legacy softplus checkpoints on load (plan B3).
+
+        Legacy state-dicts contain ``raw_c`` and ``raw_alpha``; the new
+        parameterization uses ``log_c`` and ``log_alpha``.  If either
+        legacy key is present we convert to log-space and emit a
+        visible ``UserWarning``.  ``v_max`` is kept as a buffer (the new
+        module also has a ``v_max`` buffer).
+        """
+        sd = state_dict
+        legacy_keys = ('raw_c', 'raw_alpha')
+        if any(k in sd for k in legacy_keys):
+            warnings.warn(
+                "Migrated legacy softplus weighter checkpoint "
+                "(raw_c/raw_alpha -> log_c/log_alpha)",
+                UserWarning,
+            )
+            sd = dict(sd)
+            if 'raw_c' in sd:
+                raw_c_t = sd.pop('raw_c')
+                if isinstance(raw_c_t, torch.Tensor):
+                    c_old = F.softplus(raw_c_t.to(torch.float64)) + 1e-3
+                else:
+                    c_old = F.softplus(torch.tensor(float(raw_c_t))) + 1e-3
+                sd['log_c'] = torch.log(c_old.clamp_min(1e-30))
+            if 'raw_alpha' in sd:
+                raw_a_t = sd.pop('raw_alpha')
+                if isinstance(raw_a_t, torch.Tensor):
+                    a_old = F.softplus(raw_a_t.to(torch.float64))
+                else:
+                    a_old = F.softplus(torch.tensor(float(raw_a_t)))
+                sd['log_alpha'] = torch.log(a_old.clamp_min(1e-30))
+        return super().load_state_dict(sd, strict=strict, assign=assign)
+
+    # ------------------------------------------------------------------
+    # Metadata helpers (plan B3).
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def metadata(self, *, parameterization='log_exp_v1'):
+        return {
+            'weighter_parameterization': parameterization,
+            'c': float(self.c.item()),
+            'alpha': float(self.alpha.item()),
+            'v_max': float(self.v_max.item()),
+        }
 
 
 # ----------------------------------------------------------------------------
@@ -587,7 +677,10 @@ def oracle_weighter(burst, *, floor=1e-3, dtype=None, device='cpu'):
 
 def block_robust_rls(X, d, weighter, delta, K, *, settle=None, w_init=None,
                      max_iter=100, tol=1e-8, beta=1.0,
-                     backward_mode='phantom', settle_log=None):
+                     backward_tol=None, backward_max_iter=None,
+                     backward_mode='exact', settle_log=None,
+                     settle_info_log=None,
+                     backend='dense', solver='deq'):
     """Block-parallel robust IRLS (the Phase 1.5 construction).
 
     Per plan "The construction": the sequential dependency is across
@@ -609,6 +702,33 @@ def block_robust_rls(X, d, weighter, delta, K, *, settle=None, w_init=None,
     (cheap VJP per impl step; the implicit gradient is biased but
     bounded, and the bias is measured in the Phase 1.5 gate 5).
 
+    Two backends are supported (selected by ``backend``):
+
+    * ``'dense'`` (default, backward-compatible): forms ``R`` and ``p``
+      every outer iteration and solves ``R w = p`` via the supplied
+      ``settle`` (typically ``LinearSolveLayer``).  This is the legacy
+      path from Phase 1.5.  In this backend, ``solver='direct'``
+      replaces the equilibrium settle with ``torch.linalg.solve`` —
+      the decisive training diagnostic for whether the failure mode is
+      solver accuracy (Phase C5).  ``solver='direct'`` is fully
+      differentiable (``linalg.solve`` is differentiable for
+      non-singular R).
+
+    * ``'circuit_stamp'``: assembles the KCL residual
+      ``f(w) = X^T [v * (y - X w)] - delta w`` from
+      ``TransformerConductanceBank`` + ``LeakageToGround`` and solves
+      ``f(w) = 0`` via ``WeightedGramCircuitSolve``.  ``R`` is never
+      formed in the forward path; it is implicit in the
+      ``EquilibriumSolve`` Jacobian used during the backward pass.
+      ``conductance`` (= v) is the explicit ``u`` argument to
+      ``EquilibriumSolve`` so the weighter receives gradients.
+
+    For the circuit backend the wrapper requires ``backward_mode='exact'``
+    on ``WeightedGramCircuitSolve`` for training -- the cheap
+    ``phantom`` mode is catastrophically biased at production scale
+    (rel_bias ~ 1e29 at the 2026-08-17 operating point).  For the
+    ``dense`` backend the same caution applies.
+
     Parameters
     ----------
     X : (T, d) tensor
@@ -616,7 +736,7 @@ def block_robust_rls(X, d, weighter, delta, K, *, settle=None, w_init=None,
     d : (T,) tensor
         Observations ``X @ w_o + nu``.
     weighter : callable
-        Maps (T,) residuals to (T,) influence weights v(e) in (0, 1].
+        Maps (T,) residuals to (T,) influence weights v(e) in [0, v_max].
     delta : float
         Identity regularization strength for ``R = X^T diag(v) X + delta * I``.
     K : int
@@ -624,18 +744,124 @@ def block_robust_rls(X, d, weighter, delta, K, *, settle=None, w_init=None,
     settle : callable, optional
         ``(p, R, init=None) -> w`` solver.  Defaults to
         ``LinearSolveLayer(...)`` with the specified max_iter/tol/beta.
+        Ignored when ``backend='circuit_stamp'`` (the solver is then
+        built into ``WeightedGramCircuitSolve``).  Ignored when
+        ``solver='direct'`` (the closed-form solve replaces it).
     w_init : (d,) tensor, optional
         Initial guess for the first settle.  Defaults to ``torch.zeros(d)``.
-    settle_log : list, optional
+    solver : {'deq', 'direct'}
+        Inner solve mode (only when ``backend='dense'``).  ``'deq'``
+        uses the supplied ``settle`` (default ``LinearSolveLayer``);
+        ``'direct'`` uses ``torch.linalg.solve`` (the Phase C5
+        diagnostic for isolating DEQ-specific gradient errors).
+        settle_log : list, optional
         If given, appends the settle-iteration count (``n_iter`` from
         ``EquilibriumSolve.last_info``) after each of the K+1 settles so
-        the caller can histogram the full settle cost.  Best-effort: a
+        the caller can histogram the full settle cost.  For
+        ``solver='direct'``, ``-1`` is appended at each settle (the
+        closed-form solve has no iteration count).  Best-effort: a
         custom ``settle`` that does not update ``EquilibriumSolve.last_info``
         simply contributes nothing.
+        backend : {'dense', 'circuit_stamp'}
+        Selects the residual-assembly and inner-solver path.  Default
+        ``'dense'`` preserves the prior behavior exactly.
+
+    Returns
+    -------
+    w : (d,) tensor
+        Final settled tap voltages after K+1 outer iterations.
     """
+    if backend not in ('dense', 'circuit_stamp'):
+        raise ValueError(
+            f"backend must be 'dense' or 'circuit_stamp', got {backend!r}")
+    if solver not in ('deq', 'direct'):
+        raise ValueError(
+            f"solver must be 'deq' or 'direct', got {solver!r}")
+    if backend == 'circuit_stamp' and solver != 'deq':
+        raise ValueError(
+            "backend='circuit_stamp' only supports solver='deq'")
     d_dim = X.shape[1]
     device = X.device
     dtype = X.dtype
+    def _record_settle():
+        if settle_info_log is not None:
+            info = EquilibriumSolve.last_info
+            settle_info_log.append(dict(info) if info is not None else {})
+    if backend == 'circuit_stamp':
+        if backward_mode != 'exact':
+            raise ValueError(
+                "backend='circuit_stamp' requires backward_mode='exact'; "
+                "phantom backward is not valid for the weighted-Gram circuit path")
+        # Lazy import: circuit_stamp itself lazy-imports EquilibriumSolve.
+        from utils.circuit_stamp import WeightedGramCircuitSolve
+        solver_cfg = {
+            'method': 'anderson',
+            'max_iter': max_iter,
+            'tol': tol,
+            'beta': beta,
+            'backward_mode': backward_mode,
+            'backward_tol': tol,
+            'backward_max_iter': max_iter,
+        }
+        # ``auto_beta=True`` makes the wrapper compute the chebyshev step
+        # from R's spectrum each IRLS round (consistent with the dense
+        # backend's behavior in ``_chebyshev_beta``).  The forward
+        # residual itself still does not form R; only the solver's step
+        # size does (under no_grad).
+        circuit = WeightedGramCircuitSolve(delta=delta, solver_cfg=solver_cfg,
+                                           auto_beta=True)
+
+        if w_init is None:
+            w_init = torch.zeros(d_dim, dtype=dtype, device=device)
+
+        # settle 1: plain batch LS using ones for v.
+        v0 = torch.ones(d.shape[0], dtype=dtype, device=device)
+        w = circuit(X=X, y=d, conductance=v0, w0=w_init)
+        if settle_log is not None and EquilibriumSolve.last_info is not None:
+            settle_log.append(EquilibriumSolve.last_info.get('n_iter', -1))
+        _record_settle()
+
+        for _ in range(K):
+            e = d - X @ w
+            v = weighter(e)  # graph carried through; do not detach.
+            w = circuit(X=X, y=d, conductance=v,
+                        w0=w.detach())
+            if settle_log is not None and EquilibriumSolve.last_info is not None:
+                settle_log.append(EquilibriumSolve.last_info.get('n_iter', -1))
+            _record_settle()
+        return w
+
+    # backend == 'dense'
+    if solver == 'direct':
+        # Closed-form decide: compute R, p each outer iteration and solve
+        # exactly via torch.linalg.solve (differentiable, no iteration
+        # budget).  The Phase C5 diagnostic: if this direct path reaches
+        # the grid valley while the DEQ path does not, the failure mode
+        # is solver accuracy, not training geometry.
+        if w_init is None:
+            w_init = torch.zeros(d_dim, dtype=dtype, device=device)
+        eye = delta * torch.eye(d_dim, dtype=dtype, device=device)
+
+        R0 = X.t() @ X + eye
+        p0 = X.t() @ d
+        w = torch.linalg.solve(R0, p0)
+        if settle_log is not None:
+            settle_log.append(-1)  # closed-form: no iter count
+
+        for _ in range(K):
+            e = d - X @ w
+            v = weighter(e)
+            R = X.t() @ (v.unsqueeze(-1) * X) + eye
+            p = X.t() @ (v * d)
+            # Warm-start via w.detach() is irrelevant for direct solve
+            # (no fixed-point iteration) but kept consistent.
+            w = torch.linalg.solve(R, p)
+            if settle_log is not None:
+                settle_log.append(-1)
+            # Direct solves have no EquilibriumSolve info to record.
+        return w
+
+    # solver == 'deq' (default dense path, behavior preserved exactly)
     if settle is None:
         # Default: chebyshev-style beta computed per settle from the
         # spectral radius of R, so the iteration converges for any
@@ -652,6 +878,8 @@ def block_robust_rls(X, d, weighter, delta, K, *, settle=None, w_init=None,
         settle_fn = lambda p_, R_, init=None: LinearSolveLayer(
             max_iter=max_iter, tol=tol, beta=_chebyshev_beta(R_),
             backward_mode=backward_mode,
+            backward_tol=backward_tol,
+            backward_max_iter=backward_max_iter,
         )(p_, R_, init=init)
     else:
         settle_fn = settle
@@ -665,6 +893,7 @@ def block_robust_rls(X, d, weighter, delta, K, *, settle=None, w_init=None,
     w = settle_fn(p0.unsqueeze(0), R0, init=w_init.unsqueeze(0)).squeeze(0)
     if settle_log is not None and EquilibriumSolve.last_info is not None:
         settle_log.append(EquilibriumSolve.last_info.get('n_iter', -1))
+    _record_settle()
 
     for _ in range(K):
         e = d - X @ w
@@ -675,6 +904,7 @@ def block_robust_rls(X, d, weighter, delta, K, *, settle=None, w_init=None,
         w = settle_fn(p.unsqueeze(0), R, init=w.detach().unsqueeze(0)).squeeze(0)
         if settle_log is not None and EquilibriumSolve.last_info is not None:
             settle_log.append(EquilibriumSolve.last_info.get('n_iter', -1))
+        _record_settle()
     return w
 
 
@@ -722,13 +952,14 @@ def measure_phantom_vs_exact_bias(X, d_obs, w_o, weighter, delta, K, *,
                                   max_iter=100, tol=1e-8):
     """Measure the phantom-gradient bias at the given weighter's operating point.
 
-    Training uses ``backward_mode='phantom'`` (one cheap VJP per implicit
-    step, Geng et al. 2021) but every existing gate validates only the
-    exact (CG) adjoint (~1e-10).  The gradient actually used for learning
-    is biased by construction; this measures that bias on the *trained*
-    configuration.  ``weighter`` is typically the fully-trained weighter:
-    its params are copied into two fresh instances so the only difference
-    between the phantom and exact runs is ``backward_mode``.
+    Training defaults to ``backward_mode='exact'`` (CG adjoint, validated
+    to ~1e-10 and re-verified at production scale by the FD gradcheck) and
+    the chained-K phantom VJP is catastrophically wrong at production
+    scale (rel_bias ~1e29 at the 2026-08-17 operating point).  This
+    measurement exists to keep that phantom-vs-exact gap quantified;
+    ``weighter`` is typically the fully-trained weighter: its params are
+    copied into two fresh instances so the only difference between the
+    phantom and exact runs is ``backward_mode``.
 
     The loss is the block-training loss ``||X w^K - X w_o||^2`` (the
     noiseless supervision signal of Phase 1.5 decision 1).
@@ -740,11 +971,13 @@ def measure_phantom_vs_exact_bias(X, d_obs, w_o, weighter, delta, K, *,
     ``rel_bias = |g_phantom - g_exact| / |g_exact|``.
     """
     def _clone(w):
-        w2 = LearnedRobustWeighter(raw_c=0.0, raw_alpha=0.0)
-        w2 = w2.to(w.raw_c.dtype).to(w.raw_c.device)
+        w2 = LearnedRobustWeighter(c_init=0.10, alpha_init=0.13)
+        device = next(w.parameters()).device
+        dtype = next(w.parameters()).dtype
+        w2 = w2.to(device).to(dtype)
         with torch.no_grad():
-            w2.raw_c.copy_(w.raw_c)
-            w2.raw_alpha.copy_(w.raw_alpha)
+            w2.log_c.copy_(w.log_c.to(device=device, dtype=dtype))
+            w2.log_alpha.copy_(w.log_alpha.to(device=device, dtype=dtype))
         return w2
 
     w_phantom = _clone(weighter)
@@ -753,7 +986,7 @@ def measure_phantom_vs_exact_bias(X, d_obs, w_o, weighter, delta, K, *,
                              backward_mode='phantom')
     loss_p = (X @ w_K_p - X @ w_o).pow(2).sum()
     loss_p.backward()
-    g_phantom = w_phantom.raw_c.grad.item()
+    g_phantom = w_phantom.log_c.grad.item()
 
     w_exact = _clone(weighter)
     w_K_e = block_robust_rls(X, d_obs, w_exact, delta=delta, K=K,
@@ -761,7 +994,7 @@ def measure_phantom_vs_exact_bias(X, d_obs, w_o, weighter, delta, K, *,
                              backward_mode='exact')
     loss_e = (X @ w_K_e - X @ w_o).pow(2).sum()
     loss_e.backward()
-    g_exact = w_exact.raw_c.grad.item()
+    g_exact = w_exact.log_c.grad.item()
 
     rel_bias = abs(g_phantom - g_exact) / max(abs(g_exact), 1e-12)
     return {

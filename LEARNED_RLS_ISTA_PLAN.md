@@ -1038,8 +1038,273 @@ This is more decision-relevant than the oracle alone and costs an afternoon.
 
 ## Open items (carried)
 
-- Run the full production-scale grid sweep (Kaggle GPU) and read the TRAINING vs
-  FAMILY verdict. If TRAINING: implement multi-block-per-epoch + log-reparam
-  (contingent, per the review).
-- Run `test_prod_gradcheck.py` at full scale once (CPU or GPU) to close the
-  last gradient-correctness gap.
+- ~~Run the full production-scale grid sweep (Kaggle GPU) and read the TRAINING vs
+  FAMILY verdict.~~ **DONE — TRAINING (2026-08-17); results below.**
+- ~~Run `test_prod_gradcheck.py` at full scale once (CPU or GPU) to close the
+  last gradient-correctness gap.~~ **DONE — PASS (2026-08-17); results below.**
+
+---
+
+# Production-scale results: gradcheck + oracle/OOS headroom + grid sweep (2026-08-17)
+
+Status: the two open items above are now closed. All three pieces were run on
+Kaggle (2×T4, `cuda:0` for training/sweeps, `cuda:1` for the gradcheck); the
+artifacts are in `C:\Users\Atharva\Downloads\results_deq_sweep_gradcheck_headroom`
+(`rls_demo.log`, `gradcheck.log`, `results/rls_demo/robust_block/*`).
+
+Three commands, run concurrently:
+1. `run_rls_demo.py --train_robust_block --noise impulsive --d 16 --sigma 0.01
+   --p_burst 0.02 --kappa 20 --block_N 512 --block_K 8 --block_delta 0.01
+   --block_epochs 80 --block_lr 0.01 --n_trials 8 --linear_max_iter 100
+   --linear_tol 1e-8` (GPU 0) — train + K-sweep + N-sweep + OOS + verdict.
+2. `tests/test_prod_gradcheck.py --gpu --gpu_id 1 --d 16 --N 512 --K 8`
+   (GPU 1) — the production-scale FD gradcheck.
+3. `run_rls_demo.py --grid_sweep ... --grid_c_lo 0.01 --grid_c_hi 1.0
+   --grid_n_c 20 --grid_alpha_lo 0.05 --grid_alpha_hi 20 --grid_n_alpha 20
+   --n_trials 8 --block_weighter_path results/rls_demo/robust_block/block_weighter.pt`
+   (GPU 0, after 1) — the TRAINING-vs-FAMILY decomposition.
+
+## 1. Production-scale FD gradcheck — PASS (the last correctness gap is closed)
+
+The exact implicit backward is now verified directly at production scale, not
+inferred from training behavior (closes the open item carried since 2026-08-15):
+
+```
+loss=2.978062e-03
+raw_c:     exact=7.512394e-04  best FD rel err=7.262e-05 @ eps=0.001  PASS (tol=1e-4)
+raw_alpha: exact=-7.265299e-04 best FD rel err=1.286e-05 @ eps=0.001  PASS (tol=1e-4)
+```
+
+Both parameters agree with central finite differences to < 1e-4 relative error
+at eps=1e-3 (the truncation-vs-roundoff crossover). `backward_mode='exact'` is
+correct at the scale the demo trains at.
+
+## 2. Training (80 epochs, one block per epoch)
+
+`c` drifted 0.1003 → **0.0549** (knee moves down — more aggressive downweighting),
+`α` drifted 0.1281 → **0.2343** (roll-off steepens). Both monotone; the per-epoch
+loss oscillates ~0.002–0.019 because each epoch draws a fresh random block. One
+noise note: the trainer's internal linear solves run at its own defaults
+(`max_iter=50, tol=1e-5`) and hit the 50-iter cap at residual ~1.5e-5 (the
+Anderson `ConvergenceWarning` flood in the log), while the sweeps pass
+`--linear_max_iter 100 --linear_tol 1e-8` and converge to ~1.5e-8. Training-time
+solves are therefore marginally under-converged — a contributor to gradient SNR,
+relevant to the TRAINING verdict below.
+
+## 3. K-sweep (in-sample, N=512, 8 trials) — self-check passes, then the headline
+
+`plain` is flat at **2.4063e-5 across every K** (v=1 ⇒ K-independent) — the
+fixed-block protocol self-check is clean. Full 6-contender + oracle table:
+
+| K | plain | init | learned | oracle | huber | hampel |
+|---|---|---|---|---|---|---|
+| 0 | 2.406e-5 | 2.406e-5 | 2.406e-5 | 2.406e-5 | 2.406e-5 | 2.406e-5 |
+| 1 | 2.406e-5 | 1.607e-5 | 8.789e-6 | 2.798e-6 | 3.669e-6 | 3.215e-6 |
+| 2 | 2.406e-5 | 1.599e-5 | 8.500e-6 | 2.798e-6 | 3.071e-6 | 2.875e-6 |
+| 3+ | 2.406e-5 | 1.599e-5 | 8.491e-6 | 2.798e-6 | 3.014e-6 | 2.867e-6 |
+
+Reading it:
+- All curves saturate by K≈2–3 (IRLS fixed point; depth stops mattering).
+- **learned beats plain 2.8×** and beats the init (fixed) curve **1.9×** at equal
+  depth — the learned curve is genuinely a better shape, not just "more depth".
+- But **learned is 3.0× worse than the oracle** (8.491e-6 vs 2.798e-6) **and
+  ~2.8× worse than both classical MAD-adaptive huber (3.014e-6) and hampel
+  (2.867e-6)**. This is the state the headroom and grid verdicts explain.
+
+## 4. N-sweep (K=8, one block per N)
+
+Batch columns (learned < init < plain at every N):
+
+| N | plain | init | learned | oracle | huber | hampel |
+|---|---|---|---|---|---|---|
+| 32 | 1.225e-3 | 1.077e-3 | 8.330e-4 | 5.971e-5 | 1.057e-4 | 6.355e-5 |
+| 64 | 1.298e-4 | 1.005e-4 | 6.036e-5 | 1.847e-5 | 2.175e-5 | 2.102e-5 |
+| 128 | 6.904e-5 | 4.958e-5 | 2.992e-5 | 1.424e-5 | 1.465e-5 | 1.434e-5 |
+| 256 | 4.621e-5 | 3.363e-5 | 2.036e-5 | 8.527e-6 | 8.858e-6 | 8.542e-6 |
+| 512 | 3.322e-5 | 2.057e-5 | **1.026e-5** | 2.786e-6 | 3.044e-6 | 2.953e-6 |
+
+Streaming column (sample-starved at small N): `str_learned` is *worse* than
+`str_plain` at N=32 (7.65e-3 vs 2.01e-3) and N=64, first winning at N≥128
+(N=512: 3.48e-5 vs 1.31e-4). The per-sample robust weight only helps once the
+estimator has enough samples to converge — the block form is the robust regime.
+
+## 5. Out-of-sample (test-seed offset 1,000,000) — no overfitting
+
+- OOS K-sweep: learned 8.630e-6 ≈ in-sample 8.491e-6; OOS oracle 2.884e-6,
+  huber 3.134e-6, hampel 2.990e-6. The curves fit on a train block transfer to
+  a fresh block nearly unchanged.
+- `oos_learned_vs_init_ratio = 0.53` (<1): the learned curve generalizes better
+  than the fixed curve. The headroom below is not a generalization artifact.
+
+## 6. Headroom verdict — HEADROOM (0.268)
+
+At K=8: `plain=2.406e-5, learned=8.491e-6, oracle=2.798e-6`.
+
+```
+learned/oracle ratio = 3.04
+headroom_ratio = (learned − oracle) / (plain − oracle) = 0.268  →  HEADROOM
+```
+
+The learned weighter captures ~73% of the achievable plain→oracle improvement;
+~27% of the gap remains unexploited. Verdict split at `headroom_ratio ≤ 0.10`
+(CEILING) vs above (HEADROOM).
+
+## 7. Grid sweep — TRAINING, not FAMILY (the decisive result)
+
+20×20 log grid of `FixedCauchyWeighter(c, α)` over c ∈ [0.01, 1.0],
+α ∈ [0.05, 20], scored on the same blocks as the k_sweep at N=512, K=8:
+
+```
+grid-best (c=0.1833, α=20): mse=2.817e-6   ≈ oracle 2.798e-6
+headroom_ratio_grid = 0.0009                →  TRAINING
+trained/grid-best ratio = 3.01              →  trained is 3× worse than the
+                                                best hand-placed curve
+```
+
+Implications:
+- **The Cauchy family is NOT the ceiling.** Somewhere in it — near
+  `(c≈0.18, α≳1)` — block IRLS reaches 2.817e-6, essentially the oracle and
+  **slightly better than hampel (2.867e-6)**. The learned training simply failed
+  to find that region.
+- **The trained weighter is consistent with its own parameters.** The grid
+  predicts ~8.5e-6 at the trained (c=0.055, α=0.234), matching the measured
+  8.491e-6. The problem is the parameters themselves: α stalled at 0.234 while
+  the family optimum needs α ≳ 1 (steeper roll-off). The heatmap
+  (`robust_block_grid_heatmap.png`) shows one broad curved valley of near-oracle
+  MSE; the trained point sits below it.
+- **Caveat — the grid best is on the α=20 boundary**, i.e., the top grid edge.
+  The true family optimum is at least 2.817e-6 and may be better; either way
+  the TRAINING verdict holds.
+- The failures point to the two fixes already named in the review: **under-
+  convergence** (single block per epoch, oscillating loss) and **conditioning**
+  (`softplus'` at init scales `raw_alpha` grads ~8× down) → multi-block-per-epoch
+  averaging + log-reparameterization are the contingent next step.
+
+## 8. Phantom-vs-exact at the trained operating point
+
+```
+rel_bias = 4.52e29   phantom_grad = 3.52e26   exact_grad = 7.80e-4
+```
+
+Consistent with the 2026-08-13 open issue: the chained-K phantom VJP is
+catastrophically wrong at this scale (magnitude ~10^30 off). Diagnostic only —
+training defaults to `backward_mode='exact'`; the sweeps/grid use phantom only in
+forward, so all MSE numbers above are exact-mode forward. The stale
+`measure_phantom_vs_exact_bias` docstring that claimed training uses phantom has
+been corrected.
+
+## 9. Best fixed-curve depth (isolates "curve" from "depth")
+
+`fixed_curve_vs_learned`: best fixed-curve (init) depth K=6 at 1.599e-5; learned
+at the same K=6 is 8.491e-6 — the learned curve is 1.9× better than the best
+fixed curve at identical depth, so the ~2.8× win over plain is genuinely the
+trained shape, not extra IRLS rounds.
+
+## What this means for the plan
+
+- The **correctness stack is now fully verified** (18 gates + `run_all.py` +
+  production FD gradcheck PASS).
+- The decision-relevant question from the review — TRAINING vs FAMILY — is
+  answered: **TRAINING**. The scalar `v(e)` family has the headroom; the training
+  procedure doesn't reach it. The next move is the contingent training hardening
+  (multi-block-per-epoch + log-reparam) targeting the grid's near-oracle region,
+  with the boundary caveat (α beyond 20) checked first.
+- The classical MAD-adaptive baselines beat the *trained instance* on this easy
+  regime (cleanly separable 20σ bursts), but the *family* optimum already
+  surpasses hampel — so "abandon learning" would be the wrong reading. The
+  learned curve's remaining justifications are (a) beating classical robust once
+  training lands in the valley, and (b) the chip-amenable shape: smooth,
+  branch-free, pipelinable `v(e)` vs the sort/median + piecewise-division datapath
+  of MAD huber/hampel.
+
+---
+
+# Circuit-element mapping gap + potential plan (2026-08-17)
+
+Status: **documented need, no code yet.** The user flagged a real mismatch with
+the fork's premise: the original KirchhoffNet ODE code simulates *actual circuit
+elements* (devices, topology, incidence, KCL), and the intent was for the DEQ
+work to do the same. The RLS/ISTA work does **not** — it uses the abstract
+equilibrium solver only.
+
+## The gap (what is and isn't circuit-like today)
+
+The repo has two parallel stacks:
+
+| | Circuit-element stack | RLS stack (this work) |
+|---|---|---|
+| RHS | `CircuitLayer.rhs`: `f(v,u) = -Bᵀg(Bv̂) - Γv + Su` (`circuit_block.py:416`) | `LinearSolveLayer.rhs`: `f(w) = p - Rw` (`circuit_block.py:813`) |
+| Elements | `Device`/`Conductance`/`ShiftRelu1` I-V curves (`circuit_block.py:16-240`), `topology.py` edge lists, incidence `B`, leakage `Γ`, `scatter_add` KCL | none — dense Gram matrix `R` |
+| Used by | `model.py` → `main_deq.py` (DEQ toy/image models) | `FabricRLS`, `FabricBatchRLS`, `block_robust_rls` |
+
+The block construction (`learned_robust.py:588`) builds `R = Xᵀ diag(v) X + δI`,
+`p = Xᵀ(v·d)`, and settles `R w = p`. It imports only `LinearSolveLayer` +
+`EquilibriumSolve` (`learned_robust.py:60`) — the *solver* — and never
+instantiates a `CircuitLayer`, `Device`, topology, incidence matrix, or KCL
+assembly. So the "single physical settling event on a crossbar" narrative is
+mathematically present but **not element-simulated**.
+
+## The structural (math-level) analogy that does hold
+
+`R w = p` with `R = Xᵀ diag(v) X + δI` is *exactly* a resistive network
+equilibrium, term by term:
+
+- `Xᵀ diag(v) X = Σ_t v_t x_t x_tᵀ` — sample `t` acts as conductance `v_t`
+  between the tap nodes it touches (off-diagonals) with shunts to ground
+  (diagonals). This is the resistive crossbar `Bᵀ D B`.
+- `δI` ↔ nodal leakage `Γ`.
+- `p = Xᵀ(v·d)` ↔ current injection `S u`.
+- `w` ↔ nodal voltages.
+- `v(e)` (the learned weighter) ↔ per-edge conductance `D` — the "error-aware
+  write-current multiplier" idea from `kirchhoffnet_deq_kimi_convo_summary.md:339`.
+- Anderson + Chebyshev `β` ↔ the DEQ fixed-point iteration on strongly monotone
+  `f` (same machinery as `EquilibriumBlock`).
+- Implicit backward CG ↔ the `Jᵀ y` solve (`deq_solver.py`).
+
+So the *equation* is the circuit; the *code* assembles `R` as a dense matrix and
+hands it to a generic SPD solver instead of building a topology + devices + KCL.
+The circuit is structural, not instantiated.
+
+## Why it matters
+
+- The ODE path genuinely simulates elements; the DEQ toy models (`model.py`) do
+  too, via `EquilibriumBlock`. Only the RLS demo took the shortcut.
+- If the paper's claim is "one physical settling event on a crossbar," the current
+  demo validates the settling *math* but not an element-level realization.
+- Re-expressing `R w = p` as a real `_fully_connect` topology + linear
+  `Conductance` devices (`gain = v_t`) + leakage `Γ` would be **byte-identical**
+  in the settled result (same SPD system) while being a true element simulation,
+  and would reuse `EquilibriumBlock`'s solver/backprop for free.
+
+## Potential plan (contingent, not committed)
+
+1. **Build a block-equilibrium `CircuitLayer` twin.** `BlockRobustRLSCircuit`:
+   construct the incidence `B` for a `_fully_connect(d)` topology
+   (`topology.py:111`), attach one `Conductance` device whose per-edge gains are
+   the per-sample `v_t = weighter(e)` (block-parallel, same as
+   `learned_robust.py:669-675`), leakage `γ = δ`, injection `S u = p`. Settle via
+   `EquilibriumBlock`/`EquilibriumSolve` instead of `LinearSolveLayer`.
+2. **Byte-parity gate.** `test_circuit_twin_matches_linear_solve`: for a fixed
+   block, the circuit twin's settled node voltages must match
+   `LinearSolveLayer(p, R)` to solver tolerance (assert ≲ 1e-5, mirroring the
+   existing fabric↔digital `<1e-6` gates). This is the strong claim: the circuit
+   *is* the RLS solve, not a model of it.
+3. **Carry the learned `v(e)` through.** Ensure the weighter graph threads the
+   K-outer-loop residual `e = d - X w` into the conductance values and that
+   `EquilibriumSolve.backward` (with `retain_graph=True`, `circuit_block.py:680`)
+   delivers the same training gradients as today's exact-mode path.
+4. **Re-run the K/N sweeps through the circuit twin.** Confirm the trained
+   weighter's MSE-vs-K and MSE-vs-N curves are identical (within solver tol) to
+   the numbers already reported (Section 7 above), so the element realization is
+   provably equivalent on the published results.
+5. **Documentation update.** Add the mapping table above as a permanent
+   subsection of `ARCHITECTURE.md` §5.3 (LinearSolveLayer → circuit realization)
+   and record the byte-parity evidence.
+
+Open questions before committing: whether the per-sample `v_t` conductances must
+be non-negative only (they are, `v ∈ (0,1]`, `learned_robust.py:159`), whether
+signed off-diagonal `x_ti·x_tj` conductance values (needed for dense `X`) are
+acceptable in the narrative (a real passive crossbar needs sign handling —
+`kimi_convo_summary.md:346` already flags the IR-drop/parasitic story), and
+whether the effort is worth it now vs. after the TRAINING-hardening step
+(Section "What this means for the plan").
